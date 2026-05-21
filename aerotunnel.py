@@ -554,6 +554,13 @@ class TunnelApp(App):
         table.add_column(style="bold magenta", justify="right")
         table.add_column(style="white")
         
+        remote_host = "N/A"
+        remote_port = "N/A"
+        if self.config:
+            remote_host = f"[bold cyan]{self.config.get('remote_user', '')}@{self.config.get('remote_ip', '')}[/]"
+            remote_port = f"[bold cyan]{self.config.get('remote_port', '')}[/]"
+            
+        table.add_row("Remote Host:", remote_host, "SSH Port:", remote_port)
         table.add_row("Engine Runtime:", fmt_time(app_runtime), "Uptime Ratio:", f"{uptime_pct:.3f}%")
         table.add_row("Total Uptime:", fmt_time(total_up), "Total Downtime:", fmt_time(total_down))
         table.add_row("Current Link:", fmt_time(active_session), "Longest Link:", fmt_time(max(self.stats.max_duration, active_session)))
