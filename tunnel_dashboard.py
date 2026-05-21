@@ -4,6 +4,7 @@ import json
 import time
 import asyncio
 import subprocess
+import shutil
 from datetime import datetime
 
 from textual.app import App, ComposeResult
@@ -16,6 +17,21 @@ from rich.table import Table
 
 CONFIG_PATH = os.path.expanduser("~/.config/localai_tunnel.json")
 
+# --- CONFIGURABLE NOTIFICATION SETTINGS ---
+NOTIFICATION_FAIL_THRESHOLD = 5
+NOTIFICATION_COOLDOWN_SEC = 3600  # 1 hour
+
+def send_os_notification(title: str, message: str):
+    """Sends a native OS notification via termux-notification or notify-send."""
+    # Detect Termux environment
+    if "com.termux" in os.environ.get("PREFIX", ""):
+        if shutil.which("termux-notification"):
+            subprocess.run(["termux-notification", "-t", title, "-c", message], check=False)
+    else:
+        # Default Linux desktop
+        if shutil.which("notify-send"):
+            subprocess.run(["notify-send", title, message], check=False)
+
 class TunnelStats:
     def __init__(self):
         self.attempts = 0
@@ -26,6 +42,11 @@ class TunnelStats:
         self.total_duration = 0.0
         self.status = "Initializing"
         self.current_session_start = None
+        
+        # Notification tracking
+        self.consecutive_errors = 0
+        self.last_error_notify_time = 0.0
+        self.in_error_state = False
 
     def record_disconnect(self):
         if self.current_session_start:
@@ -71,7 +92,6 @@ class BindingModal(ModalScreen[dict]):
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
         ("space", "toggle", "Toggle 0.0.0.0 / 127.0.0.1")
-        # Note: 'enter' is handled via on_key to bypass DataTable's default interception
     ]
 
     def __init__(self, current_bindings):
@@ -102,7 +122,6 @@ class BindingModal(ModalScreen[dict]):
             table.add_row(srv.upper().replace("_", "-"), ip_display, key=srv)
 
     def on_key(self, event: events.Key) -> None:
-        # Override DataTable's default 'enter' behavior so it actually submits the form
         if event.key == "enter":
             self.action_apply()
             event.prevent_default()
@@ -135,7 +154,6 @@ class LogScreen(ModalScreen):
 
     def on_mount(self) -> None:
         logger = self.query_one(RichLog)
-        # Flush the app's memory buffer into the UI when opened
         for msg in getattr(self.app, "log_history", []):
             logger.write(msg)
 
@@ -169,29 +187,17 @@ class TunnelApp(App):
         background: $background 80%;
     }
     
-    #log_panel {
-        /* Force to maximum viewport dimensions with a tiny margin */
-        width: 100w; 
-        height: 100h;
-        margin: 1 2; 
+    /* Shared flexible container for all Modals */
+    #log_panel, #help_panel, #dialog {
+        width: 90%; 
+        max-width: 90;
         border: solid $primary; 
         background: $surface;
-    }
-    
-    #help_panel {
-        width: 70;
-        height: auto;
         padding: 1 2;
-        border: thick cyan; 
-        background: $surface;
     }
     
-    #dialog {
-        padding: 1 2;
-        border: thick cyan; background: $surface;
-        width: 60; height: auto;
-    }
-    
+    #log_panel { height: 90%; }
+    #help_panel, #dialog { height: auto; }
     #dialog_title { text-align: center; margin-bottom: 1; width: 100%; }
     """
 
@@ -222,7 +228,7 @@ class TunnelApp(App):
         try:
             with open(CONFIG_PATH, "r") as f:
                 return json.load(f)
-        except Exception as e:
+        except Exception:
             return None
 
     def compose(self) -> ComposeResult:
@@ -261,7 +267,6 @@ class TunnelApp(App):
         if self.config:
             for name, ports in self.config.get("services", {}).items():
                 bind_ip = self.service_bindings.get(name, "127.0.0.1")
-                # Highlight 0.0.0.0 strongly to warn the user
                 bind_display = f"[bold white on red] 0.0.0.0 [/]" if bind_ip == "0.0.0.0" else f"[bold green]{bind_ip}[/]"
                 table.add_row(
                     name.upper().replace("_", "-"), 
@@ -280,7 +285,6 @@ class TunnelApp(App):
             self.log_msg("[red]Cannot open shell: No config loaded.[/red]")
             return
 
-        # Textual temporarily steps aside and gives you the raw terminal
         with self.suspend():
             os.system('cls' if os.name == 'nt' else 'clear')
             print("\n\033[1;36m▲ LOCAL LLM TUNNEL // INTERACTIVE SHELL\033[0m")
@@ -289,8 +293,6 @@ class TunnelApp(App):
             print("\033[1;31m============================================================\033[0m\n")
             print("Handshaking with remote server...")
             
-            # 2.5 second hard pause so the user physically cannot miss the Ctrl+D warning 
-            # before the SSH process clears the screen.
             time.sleep(2.5) 
             
             cmd = [
@@ -305,7 +307,6 @@ class TunnelApp(App):
             except Exception as e:
                 print(f"Shell error: {e}")
                 
-            # Tiny visual pause before the UI snaps back
             time.sleep(0.5) 
 
     @work
@@ -360,6 +361,36 @@ class TunnelApp(App):
 
         self.query_one("#stats_text", Static).update(table)
 
+    def handle_connection_failure(self):
+        """Processes connection errors and triggers OS notifications if thresholds are met."""
+        self.stats.consecutive_errors += 1
+        self.stats.errors += 1
+        
+        if self.stats.consecutive_errors >= NOTIFICATION_FAIL_THRESHOLD:
+            now = time.time()
+            if not self.stats.in_error_state or (now - self.stats.last_error_notify_time) > NOTIFICATION_COOLDOWN_SEC:
+                send_os_notification(
+                    "LLM Tunnel Down", 
+                    f"Connection failed {self.stats.consecutive_errors} times in a row."
+                )
+                self.stats.last_error_notify_time = now
+                self.stats.in_error_state = True
+
+    def handle_connection_success(self):
+        """Resets error state and notifies OS if recovering from an error state."""
+        if self.stats.in_error_state:
+            send_os_notification(
+                "LLM Tunnel Restored", 
+                "Connection to remote LLM server re-established."
+            )
+            self.stats.in_error_state = False
+            
+        self.stats.consecutive_errors = 0
+        self.stats.success_count += 1
+        self.stats.current_session_start = time.time()
+        if self.stats.first_success == "N/A":
+            self.stats.first_success = datetime.now().strftime("%H:%M:%S")
+
     @work(exclusive=True)
     async def run_ssh_loop(self):
         if not self.config:
@@ -409,13 +440,10 @@ class TunnelApp(App):
                 
                 if self.ssh_process.returncode is not None:
                     self.log_msg(f"[bold red]SSH process died immediately with code {self.ssh_process.returncode}[/bold red]")
-                    self.stats.errors += 1
+                    self.handle_connection_failure()
                 else:
                     self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
-                    self.stats.success_count += 1
-                    self.stats.current_session_start = time.time()
-                    if self.stats.first_success == "N/A":
-                        self.stats.first_success = datetime.now().strftime("%H:%M:%S")
+                    self.handle_connection_success()
                     
                     await self.ssh_process.wait()
                     
@@ -426,12 +454,12 @@ class TunnelApp(App):
                         
                     self.log_msg(f"[red]Link dropped (Code: {self.ssh_process.returncode})[/red]")
                     self.stats.record_disconnect()
-                    self.stats.errors += 1
+                    self.handle_connection_failure()
                     
             except Exception as e:
                 self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
                 self.stats.record_disconnect()
-                self.stats.errors += 1
+                self.handle_connection_failure()
                 
             self.stats.status = "Host Unreachable"
             self.log_msg("[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]")
