@@ -15,7 +15,7 @@ from textual import work, events
 
 from rich.table import Table
 
-CONFIG_PATH = os.path.expanduser("~/.config/localai_tunnel.json")
+CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
 
 # --- CONFIGURABLE NOTIFICATION SETTINGS ---
 NOTIFICATION_FAIL_THRESHOLD = 5
@@ -266,7 +266,7 @@ class TunnelApp(App):
     def on_mount(self) -> None:
         self.install_screen(LogScreen(), name="log_screen")
         self.install_screen(HelpScreen(), name="help_screen")
-        self.title = "▲ LOCAL LLM TUNNEL CONTROL ENGINE"
+        self.title = "▲ AEROTUNNEL COMMAND STATUS"
         
         self.update_services_table()
         self.set_interval(1.0, self.update_ui)
