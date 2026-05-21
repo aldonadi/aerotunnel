@@ -3,6 +3,7 @@ import os
 import json
 import time
 import asyncio
+import subprocess
 from datetime import datetime
 
 from textual.app import App, ComposeResult
@@ -147,10 +148,10 @@ class TunnelApp(App):
     
     #dialog_title { text-align: center; margin-bottom: 1; width: 100%; }
     """
-
     BINDINGS = [
         ("b", "configure_bindings", "Bindings"),
         ("l", "toggle_log", "Logs"),
+        ("s", "open_shell", "Shell"),
         ("q", "quit", "Quit")
     ]
 
@@ -236,6 +237,32 @@ class TunnelApp(App):
             self.update_services_table()
             self.log_msg("[yellow]Network bindings updated. Restarting SSH tunnel...[/yellow]")
             self.restart_tunnel()
+
+    def action_open_shell(self) -> None:
+        if not self.config:
+            self.log_msg("[red]Cannot open shell: No config loaded.[/red]")
+            return
+
+        # Textual temporarily steps aside and gives you the raw terminal
+        with self.suspend():
+            print("\n\033[1;36m▲ LOCAL LLM TUNNEL // INTERACTIVE SHELL\033[0m")
+            print("\033[2mType 'exit' or press Ctrl+D to return to the dashboard.\033[0m\n")
+            
+            cmd = [
+                "ssh",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-p", str(self.config["remote_port"]),
+                f"{self.config['remote_user']}@{self.config['remote_ip']}"
+            ]
+            
+            try:
+                # Run a foreground, interactive SSH process
+                subprocess.run(cmd)
+            except Exception as e:
+                print(f"Shell error: {e}")
+                
+            # A tiny visual pause before the UI snaps back
+            time.sleep(0.5)
 
     def restart_tunnel(self):
         self.intentional_restart = True
