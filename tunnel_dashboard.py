@@ -296,10 +296,13 @@ class TunnelApp(App):
             time.sleep(2.5) 
             
             cmd = [
-                "ssh",
+                "ssh", "-N",
+                "-o", "ServerAliveInterval=10",     # Ping server every 10 seconds
+                "-o", "ServerAliveCountMax=2",      # Drop connection if 2 pings fail (20s max)
+                "-o", "ConnectTimeout=5",           # Give up connecting if it takes > 5 seconds
+                "-o", "ExitOnForwardFailure=yes",
                 "-o", "StrictHostKeyChecking=accept-new",
-                "-p", str(self.config["remote_port"]),
-                f"{self.config['remote_user']}@{self.config['remote_ip']}"
+                "-p", str(self.config["remote_port"])
             ]
             
             try:
@@ -436,15 +439,21 @@ class TunnelApp(App):
                 asyncio.create_task(read_stream(self.ssh_process.stdout))
                 asyncio.create_task(read_stream(self.ssh_process.stderr, True))
                 
-                await asyncio.sleep(1.5)
-                
-                if self.ssh_process.returncode is not None:
-                    self.log_msg(f"[bold red]SSH process died immediately with code {self.ssh_process.returncode}[/bold red]")
+                try:
+                    # We give SSH exactly 6 seconds to prove it's stable.
+                    # Since ConnectTimeout is 5s, if it fails to connect, it will crash before this timeout.
+                    await asyncio.wait_for(self.ssh_process.wait(), timeout=6.0)
+                    
+                    # If wait() completes before 6 seconds, the SSH process died prematurely.
+                    self.log_msg(f"[bold red]Connection rejected or unreachable (Code: {self.ssh_process.returncode})[/bold red]")
                     self.handle_connection_failure()
-                else:
+                    
+                except asyncio.TimeoutError:
+                    # If it survives 6 seconds, it has successfully navigated the TCP handshake and is connected.
                     self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
                     self.handle_connection_success()
                     
+                    # Now block and wait indefinitely for the actual session to end
                     await self.ssh_process.wait()
                     
                     if self.intentional_restart:
@@ -452,7 +461,7 @@ class TunnelApp(App):
                         self.stats.record_disconnect()
                         continue
                         
-                    self.log_msg(f"[red]Link dropped (Code: {self.ssh_process.returncode})[/red]")
+                    self.log_msg(f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]")
                     self.stats.record_disconnect()
                     self.handle_connection_failure()
                     
