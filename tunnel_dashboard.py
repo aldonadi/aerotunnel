@@ -41,12 +41,37 @@ class TunnelStats:
         active = (time.time() - self.current_session_start) if self.current_session_start else 0
         return (self.total_duration + active) / self.success_count
 
+# --- HELP MODAL ---
+class HelpScreen(ModalScreen):
+    BINDINGS = [("escape", "app.pop_screen", "Close"), ("h", "app.pop_screen", "Close")]
+    
+    def compose(self) -> ComposeResult:
+        help_text = """[bold cyan]▲ LOCAL LLM TUNNEL // HELP & CONTROLS[/bold cyan]
+
+[bold]Keyboard Shortcuts:[/bold]
+• [yellow]b[/yellow] : Configure Network Bindings
+  [dim]Selectively expose services to your local network (0.0.0.0) or restrict them to your device only (127.0.0.1).[/dim]
+
+• [yellow]l[/yellow] : View System Logs
+  [dim]Opens the raw SSH output buffer. Essential for debugging connection drops or auth failures.[/dim]
+
+• [yellow]s[/yellow] : Interactive Shell
+  [dim]Suspends the UI and drops you into a native terminal session on the remote server.[/dim]
+  [bold red]CRITICAL:[/bold red] Type 'exit' or press [bold]Ctrl+D[/bold] in the remote shell to return to this dashboard!
+
+• [yellow]h[/yellow] : Show this Help dialog
+
+• [yellow]q[/yellow] : Quit application
+
+[dim]Press ESC or 'h' to close this dialog.[/dim]"""
+        yield Container(Static(help_text, markup=True), id="help_panel")
+
 # --- BINDING CONFIGURATION MODAL ---
 class BindingModal(ModalScreen[dict]):
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
-        ("enter", "apply", "Apply & Restart"),
         ("space", "toggle", "Toggle 0.0.0.0 / 127.0.0.1")
+        # Note: 'enter' is handled via on_key to bypass DataTable's default interception
     ]
 
     def __init__(self, current_bindings):
@@ -67,24 +92,33 @@ class BindingModal(ModalScreen[dict]):
         table.add_column("Bind Address", key="ip")
         
         for srv, ip in self.working_bindings.items():
-            table.add_row(srv.upper().replace("_", "-"), ip, key=srv)
+            self._add_or_update_row(table, srv, ip)
+
+    def _add_or_update_row(self, table, srv, ip):
+        ip_display = f"[bold white on red] 0.0.0.0 [/]" if ip == "0.0.0.0" else f"[bold green]{ip}[/]"
+        if srv in [row.value for row in table.rows]:
+            table.update_cell(srv, "ip", ip_display)
+        else:
+            table.add_row(srv.upper().replace("_", "-"), ip_display, key=srv)
+
+    def on_key(self, event: events.Key) -> None:
+        # Override DataTable's default 'enter' behavior so it actually submits the form
+        if event.key == "enter":
+            self.action_apply()
+            event.prevent_default()
 
     def action_toggle(self) -> None:
         table = self.query_one(DataTable)
         if table.row_count == 0: return
         
-        # Get the underlying service key from the cursor's row
         row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
         srv = row_key.value
         
-        # Toggle logic
         current_ip = self.working_bindings[srv]
         new_ip = "0.0.0.0" if current_ip == "127.0.0.1" else "127.0.0.1"
         self.working_bindings[srv] = new_ip
         
-        # Visually update the table cell
-        ip_display = f"[bold green]{new_ip}[/]" if new_ip == "0.0.0.0" else new_ip
-        table.update_cell(row_key, "ip", ip_display)
+        self._add_or_update_row(table, srv, new_ip)
 
     def action_apply(self) -> None:
         self.dismiss(self.working_bindings)
@@ -95,12 +129,13 @@ class BindingModal(ModalScreen[dict]):
 # --- LOGGING MODAL ---
 class LogScreen(ModalScreen):
     BINDINGS = [("l", "app.pop_screen", "Close Log"), ("escape", "app.pop_screen", "Close")]
+    
     def compose(self) -> ComposeResult:
         yield Container(RichLog(id="app_log", highlight=True, markup=True), id="log_panel")
 
     def on_mount(self) -> None:
         logger = self.query_one(RichLog)
-        # Flush the app's memory buffer into the UI
+        # Flush the app's memory buffer into the UI when opened
         for msg in getattr(self.app, "log_history", []):
             logger.write(msg)
 
@@ -109,14 +144,13 @@ class TunnelApp(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 2 1; /* Default: 2 columns, 1 row */
+        grid-size: 2 1; 
         grid-columns: 1fr 1fr;
         padding: 1;
     }
     
-    /* Python on_resize hook will apply this class on narrow terminals */
     Screen.mobile_layout {
-        grid-size: 1 2; /* Switch to: 1 column, 2 rows */
+        grid-size: 1 2; 
         grid-rows: 1fr 1fr;
         grid-columns: 1fr;
     }
@@ -130,14 +164,26 @@ class TunnelApp(App):
     #stats_container { border: round magenta; border-title-color: magenta; }
     #services_container { border-title-color: cyan; }
     
-    LogScreen, BindingModal {
+    LogScreen, BindingModal, HelpScreen {
         align: center middle;
         background: $background 80%;
     }
     
     #log_panel {
-        width: 100%; height: 100%;
-        border: solid $primary; background: $surface;
+        /* Force to maximum viewport dimensions with a tiny margin */
+        width: 100w; 
+        height: 100h;
+        margin: 1 2; 
+        border: solid $primary; 
+        background: $surface;
+    }
+    
+    #help_panel {
+        width: 70;
+        height: auto;
+        padding: 1 2;
+        border: thick cyan; 
+        background: $surface;
     }
     
     #dialog {
@@ -148,7 +194,9 @@ class TunnelApp(App):
     
     #dialog_title { text-align: center; margin-bottom: 1; width: 100%; }
     """
+
     BINDINGS = [
+        ("h", "show_help", "Help"),
         ("b", "configure_bindings", "Bindings"),
         ("l", "toggle_log", "Logs"),
         ("s", "open_shell", "Shell"),
@@ -163,13 +211,8 @@ class TunnelApp(App):
         self.ssh_process = None
         self.intentional_restart = False
         self.sleep_task = None
-
-        # logging temp buffer, to handle race cconditions
-        # where the logfer tries to log before the UI is
-        # fully initialized
         self.log_history = []
         
-        # Initialize default bindings to secure localhost
         self.service_bindings = {}
         if self.config:
             for srv in self.config.get("services", {}).keys():
@@ -197,6 +240,7 @@ class TunnelApp(App):
 
     def on_mount(self) -> None:
         self.install_screen(LogScreen(), name="log_screen")
+        self.install_screen(HelpScreen(), name="help_screen")
         self.title = "▲ LOCAL LLM TUNNEL CONTROL ENGINE"
         
         self.update_services_table()
@@ -204,7 +248,6 @@ class TunnelApp(App):
         self.run_ssh_loop()
 
     def on_resize(self, event: events.Resize) -> None:
-        # Dynamically toggle Textual CSS layout on resize instead of @media
         if event.size.width < 80:
             self.screen.add_class("mobile_layout")
         else:
@@ -218,26 +261,20 @@ class TunnelApp(App):
         if self.config:
             for name, ports in self.config.get("services", {}).items():
                 bind_ip = self.service_bindings.get(name, "127.0.0.1")
-                bind_display = f"[bold green]{bind_ip}[/]" if bind_ip == "0.0.0.0" else bind_ip
+                # Highlight 0.0.0.0 strongly to warn the user
+                bind_display = f"[bold white on red] 0.0.0.0 [/]" if bind_ip == "0.0.0.0" else f"[bold green]{bind_ip}[/]"
                 table.add_row(
                     name.upper().replace("_", "-"), 
                     f"{bind_display}:{ports['local']}", 
                     str(ports['remote'])
                 )
 
+    def action_show_help(self) -> None:
+        self.push_screen("help_screen")
+
     def action_toggle_log(self) -> None:
         self.push_screen("log_screen")
-
-    @work
-    async def action_configure_bindings(self) -> None:
-        # Wait for user to interact with the modal
-        new_bindings = await self.push_screen_wait(BindingModal(self.service_bindings))
-        if new_bindings:
-            self.service_bindings = new_bindings
-            self.update_services_table()
-            self.log_msg("[yellow]Network bindings updated. Restarting SSH tunnel...[/yellow]")
-            self.restart_tunnel()
-
+        
     def action_open_shell(self) -> None:
         if not self.config:
             self.log_msg("[red]Cannot open shell: No config loaded.[/red]")
@@ -245,8 +282,16 @@ class TunnelApp(App):
 
         # Textual temporarily steps aside and gives you the raw terminal
         with self.suspend():
+            os.system('cls' if os.name == 'nt' else 'clear')
             print("\n\033[1;36m▲ LOCAL LLM TUNNEL // INTERACTIVE SHELL\033[0m")
-            print("\033[2mType 'exit' or press Ctrl+D to return to the dashboard.\033[0m\n")
+            print("\033[1;31m============================================================\033[0m")
+            print("\033[1;33m REMINDER: Press CTRL+D or type 'exit' to return to the TUI \033[0m")
+            print("\033[1;31m============================================================\033[0m\n")
+            print("Handshaking with remote server...")
+            
+            # 2.5 second hard pause so the user physically cannot miss the Ctrl+D warning 
+            # before the SSH process clears the screen.
+            time.sleep(2.5) 
             
             cmd = [
                 "ssh",
@@ -256,13 +301,21 @@ class TunnelApp(App):
             ]
             
             try:
-                # Run a foreground, interactive SSH process
                 subprocess.run(cmd)
             except Exception as e:
                 print(f"Shell error: {e}")
                 
-            # A tiny visual pause before the UI snaps back
-            time.sleep(0.5)
+            # Tiny visual pause before the UI snaps back
+            time.sleep(0.5) 
+
+    @work
+    async def action_configure_bindings(self) -> None:
+        new_bindings = await self.push_screen_wait(BindingModal(self.service_bindings))
+        if new_bindings:
+            self.service_bindings = new_bindings
+            self.update_services_table()
+            self.log_msg("[yellow]Network bindings updated. Restarting SSH tunnel...[/yellow]")
+            self.restart_tunnel()
 
     def restart_tunnel(self):
         self.intentional_restart = True
@@ -278,19 +331,16 @@ class TunnelApp(App):
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_msg = f"[dim]{timestamp}[/dim] {msg}"
         
-        # Save to memory buffer (keep last 500 lines to prevent memory bloat)
         self.log_history.append(formatted_msg)
         if len(self.log_history) > 500:
             self.log_history.pop(0)
             
-        # Safely attempt to write to the UI if it exists
         try:
             if self.is_screen_installed("log_screen"):
                 log_screen = self.get_screen("log_screen")
                 logger = log_screen.query_one(RichLog)
                 self.call_from_thread(logger.write, formatted_msg)
         except Exception:
-            # Widget isn't fully drawn yet; ignore and let on_mount handle it later
             pass
 
     def update_ui(self):
@@ -310,7 +360,7 @@ class TunnelApp(App):
 
         self.query_one("#stats_text", Static).update(table)
 
-    @work(exclusive=True) # Runs on main asyncio loop
+    @work(exclusive=True)
     async def run_ssh_loop(self):
         if not self.config:
             self.log_msg(f"[red]Error: Could not load config at {CONFIG_PATH}[/red]")
@@ -331,7 +381,6 @@ class TunnelApp(App):
                 "-p", str(self.config["remote_port"])
             ]
             
-            # Map ports dynamically based on user's active bindings
             for srv_name, ports in self.config["services"].items():
                 bind_ip = self.service_bindings.get(srv_name, "127.0.0.1")
                 cmd.extend(["-L", f"{bind_ip}:{ports['local']}:127.0.0.1:{ports['remote']}"])
@@ -370,7 +419,6 @@ class TunnelApp(App):
                     
                     await self.ssh_process.wait()
                     
-                    # Intercept intentional user restarts so they aren't tracked as errors
                     if self.intentional_restart:
                         self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
                         self.stats.record_disconnect()
@@ -392,7 +440,6 @@ class TunnelApp(App):
                 self.sleep_task = asyncio.create_task(asyncio.sleep(5))
                 await self.sleep_task
             except asyncio.CancelledError:
-                # Caught an intentional restart during the sleep backoff
                 pass
 
 if __name__ == "__main__":
