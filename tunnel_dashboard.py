@@ -135,8 +135,8 @@ class TunnelApp(App):
     }
     
     #log_panel {
-        width: 90%; height: 90%;
-        border: thick $primary; background: $surface;
+        width: 100%; height: 100%;
+        border: solid $primary; background: $surface;
     }
     
     #dialog {
