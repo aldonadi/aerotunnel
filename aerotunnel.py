@@ -410,6 +410,14 @@ class TunnelApp(App):
         self.set_interval(1.0, self.update_ui)
         self.run_ssh_loop()
 
+    def on_unmount(self) -> None:
+        self.running = False
+        if self.ssh_process:
+            try:
+                self.ssh_process.terminate()
+            except Exception:
+                pass
+
     def on_resize(self, event: events.Resize) -> None:
         if event.size.width < 80:
             self.screen.add_class("mobile_layout")
@@ -609,82 +617,97 @@ class TunnelApp(App):
 
         self.log_msg("[bold cyan]System Initialized. Starting routing loop...[/bold cyan]")
 
-        while self.running:
-            self.intentional_restart = False
-            self.stats.attempts += 1
-            self.stats.status = "Routing..."
-            
-            cmd = [
-                "ssh", "-N",
-                "-o", "ServerAliveInterval=10",
-                "-o", "ServerAliveCountMax=2", 
-                "-o", "ConnectTimeout=5",
-                "-o", "ExitOnForwardFailure=yes",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-p", str(self.config["remote_port"])
-            ]
-            
-            for srv_name, ports in self.config["services"].items():
-                bind_ip = self.service_bindings.get(srv_name, "127.0.0.1")
-                cmd.extend(["-L", f"{bind_ip}:{ports['local']}:127.0.0.1:{ports['remote']}"])
+        try:
+            while self.running:
+                self.intentional_restart = False
+                self.stats.attempts += 1
+                self.stats.status = "Routing..."
                 
-            cmd.append(f"{self.config['remote_user']}@{self.config['remote_ip']}")
-            self.log_msg(f"[yellow]Spawning Subprocess:[/yellow] {' '.join(cmd)}")
-            
-            try:
-                self.ssh_process = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
+                cmd = [
+                    "ssh", "-N",
+                    "-o", "ServerAliveInterval=10",
+                    "-o", "ServerAliveCountMax=2", 
+                    "-o", "ConnectTimeout=5",
+                    "-o", "ExitOnForwardFailure=yes",
+                    "-o", "StrictHostKeyChecking=accept-new",
+                    "-p", str(self.config["remote_port"])
+                ]
                 
-                async def read_stream(stream, is_stderr=False):
-                    while True:
-                        line = await stream.readline()
-                        if not line: break
-                        color = "red" if is_stderr else "dim white"
-                        self.log_msg(f"[{color}][SSH] {line.decode().strip()}[/{color}]")
-
-                asyncio.create_task(read_stream(self.ssh_process.stdout))
-                asyncio.create_task(read_stream(self.ssh_process.stderr, True))
+                for srv_name, ports in self.config["services"].items():
+                    bind_ip = self.service_bindings.get(srv_name, "127.0.0.1")
+                    cmd.extend(["-L", f"{bind_ip}:{ports['local']}:127.0.0.1:{ports['remote']}"])
+                    
+                cmd.append(f"{self.config['remote_user']}@{self.config['remote_ip']}")
+                self.log_msg(f"[yellow]Spawning Subprocess:[/yellow] {' '.join(cmd)}")
                 
-                # We give SSH exactly 6 seconds to prove it's stable.
                 try:
-                    await asyncio.wait_for(self.ssh_process.wait(), timeout=6.0)
-                    # If it exits before 6 seconds, the connection failed early.
-                    self.log_msg(f"[bold red]Connection rejected or unreachable (Code: {self.ssh_process.returncode})[/bold red]")
-                    self.handle_connection_failure()
+                    self.ssh_process = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
                     
-                except asyncio.TimeoutError:
-                    # Connection survived the 6-second gauntlet. It is legitimate.
-                    self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
-                    self.handle_connection_success()
+                    async def read_stream(stream, is_stderr=False):
+                        while True:
+                            line = await stream.readline()
+                            if not line: break
+                            color = "red" if is_stderr else "dim white"
+                            self.log_msg(f"[{color}][SSH] {line.decode().strip()}[/{color}]")
+
+                    asyncio.create_task(read_stream(self.ssh_process.stdout))
+                    asyncio.create_task(read_stream(self.ssh_process.stderr, True))
                     
-                    # Wait indefinitely for the session to organically drop
-                    await self.ssh_process.wait()
-                    
-                    if self.intentional_restart:
-                        self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
-                        self.stats.record_disconnect()
-                        continue
+                    # We give SSH exactly 6 seconds to prove it's stable.
+                    try:
+                        await asyncio.wait_for(self.ssh_process.wait(), timeout=6.0)
+                        # If it exits before 6 seconds, the connection failed early.
+                        self.log_msg(f"[bold red]Connection rejected or unreachable (Code: {self.ssh_process.returncode})[/bold red]")
+                        self.handle_connection_failure()
                         
-                    self.log_msg(f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]")
+                    except asyncio.TimeoutError:
+                        # Connection survived the 6-second gauntlet. It is legitimate.
+                        self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
+                        self.handle_connection_success()
+                        
+                        # Wait indefinitely for the session to organically drop
+                        await self.ssh_process.wait()
+                        
+                        if self.intentional_restart:
+                            self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
+                            self.stats.record_disconnect()
+                            continue
+                            
+                        self.log_msg(f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]")
+                        self.handle_connection_failure()
+                        
+                except Exception as e:
+                    self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
                     self.handle_connection_failure()
                     
-            except Exception as e:
-                self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
-                self.handle_connection_failure()
+                self.stats.status = "Host Unreachable"
+                self.log_msg("[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]")
                 
-            self.stats.status = "Host Unreachable"
-            self.log_msg("[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]")
-            
-            try:
-                self.sleep_task = asyncio.create_task(asyncio.sleep(5))
-                await self.sleep_task
-            except asyncio.CancelledError:
-                pass
+                try:
+                    self.sleep_task = asyncio.create_task(asyncio.sleep(5))
+                    await self.sleep_task
+                except asyncio.CancelledError:
+                    pass
+        finally:
+            self.running = False
+            if self.ssh_process:
+                try:
+                    self.ssh_process.terminate()
+                except Exception:
+                    pass
 
 if __name__ == "__main__":
     check_config_on_startup()
     app = TunnelApp()
-    app.run()
+    try:
+        app.run()
+    finally:
+        if hasattr(app, 'ssh_process') and app.ssh_process:
+            try:
+                app.ssh_process.terminate()
+            except Exception:
+                pass
