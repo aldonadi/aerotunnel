@@ -17,6 +17,13 @@ from rich.table import Table
 
 CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
 
+# Version Information
+MAJOR = 0
+MINOR = 2
+PATCH = 0
+VERSION = f"{MAJOR}.{MINOR}.{PATCH}"
+DATE_RELEASED = "2026-05-21"
+
 def load_json_with_comments(filepath):
     import re
     with open(filepath, 'r') as f:
@@ -222,7 +229,7 @@ class TunnelStats:
 class HelpScreen(ModalScreen):
     BINDINGS = [("escape", "app.pop_screen", "Close"), ("h", "app.pop_screen", "Close")]
     def compose(self) -> ComposeResult:
-        help_text = """[bold cyan]▲ LOCAL LLM TUNNEL // HELP & CONTROLS[/bold cyan]
+        help_text = f"""[bold cyan]▲ LOCAL LLM TUNNEL // HELP & CONTROLS[/bold cyan]
 
 [bold]Keyboard Shortcuts:[/bold]
 • [yellow]b[/yellow] : Configure Network Bindings
@@ -241,6 +248,12 @@ class HelpScreen(ModalScreen):
 • [yellow]h[/yellow] : Show this Help dialog
 
 • [yellow]q[/yellow] : Quit application
+
+[bold cyan]============================================================[/bold cyan]
+[bold]About:[/bold]
+• [yellow]Version:[/yellow] v{VERSION}
+• [yellow]Released:[/yellow] {DATE_RELEASED}
+• [yellow]Author:[/yellow] Andrew Wilson
 
 [dim]Press ESC or 'h' to close this dialog.[/dim]"""
         yield Container(Static(help_text, markup=True), id="help_panel")
@@ -405,6 +418,7 @@ class TunnelApp(App):
         self.install_screen(LogScreen(), name="log_screen")
         self.install_screen(HelpScreen(), name="help_screen")
         self.title = "▲ AEROTUNNEL COMMAND STATUS"
+        self.sub_title = f"v{VERSION} ({DATE_RELEASED})"
         
         self.update_services_table()
         self.set_interval(1.0, self.update_ui)
@@ -569,7 +583,7 @@ class TunnelApp(App):
             remote_port = f"[bold cyan]{self.config.get('remote_port', '')}[/]"
             
         table.add_row("Remote Host:", remote_host, "SSH Port:", remote_port)
-        table.add_row("Engine Runtime:", fmt_time(app_runtime), "Uptime Ratio:", f"{uptime_pct:.3f}%")
+        table.add_row("Engine Runtime:", fmt_time(app_runtime), "Uptime Ratio:", f"{uptime_pct:.5f}%")
         table.add_row("Total Uptime:", fmt_time(total_up), "Total Downtime:", fmt_time(total_down))
         table.add_row("Current Link:", fmt_time(active_session), "Longest Link:", fmt_time(max(self.stats.max_duration, active_session)))
         table.add_row("Current Outage:", fmt_time(active_outage), "Longest Outage:", fmt_time(max_outage_display))
