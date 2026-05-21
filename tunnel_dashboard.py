@@ -28,15 +28,14 @@ def send_os_notification(title: str, message: str):
     else:
         if shutil.which("notify-send"):
             subprocess.run(["notify-send", title, message], check=False)
-
 def fmt_time(seconds: float) -> str:
     """Helper to convert raw seconds into a readable Xh Ym Zs format."""
-    if seconds < 0: return "0.0s"
+    if seconds < 0: return "0s"
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
     if h > 0: return f"{h}h {m}m {s}s"
     if m > 0: return f"{m}m {s}s"
-    return f"{seconds:.1f}s"
+    return f"{int(seconds)}s"  # <--- Changed this line from {seconds:.1f}s
 
 class TunnelStats:
     def __init__(self):
@@ -270,7 +269,7 @@ class TunnelApp(App):
         self.title = "▲ LOCAL LLM TUNNEL CONTROL ENGINE"
         
         self.update_services_table()
-        self.set_interval(0.1, self.update_ui)
+        self.set_interval(1.0, self.update_ui)
         self.run_ssh_loop()
 
     def on_resize(self, event: events.Resize) -> None:
