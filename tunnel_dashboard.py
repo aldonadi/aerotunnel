@@ -22,28 +22,42 @@ NOTIFICATION_FAIL_THRESHOLD = 5
 NOTIFICATION_COOLDOWN_SEC = 3600  # 1 hour
 
 def send_os_notification(title: str, message: str):
-    """Sends a native OS notification via termux-notification or notify-send."""
-    # Detect Termux environment
     if "com.termux" in os.environ.get("PREFIX", ""):
         if shutil.which("termux-notification"):
             subprocess.run(["termux-notification", "-t", title, "-c", message], check=False)
     else:
-        # Default Linux desktop
         if shutil.which("notify-send"):
             subprocess.run(["notify-send", title, message], check=False)
 
+def fmt_time(seconds: float) -> str:
+    """Helper to convert raw seconds into a readable Xh Ym Zs format."""
+    if seconds < 0: return "0.0s"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0: return f"{h}h {m}m {s}s"
+    if m > 0: return f"{m}m {s}s"
+    return f"{seconds:.1f}s"
+
 class TunnelStats:
     def __init__(self):
+        self.app_start_time = time.time()
         self.attempts = 0
         self.success_count = 0
         self.errors = 0
         self.first_success = "N/A"
+        self.status = "Initializing"
+        
+        # Connection trackers
+        self.current_session_start = None
         self.max_duration = 0.0
         self.total_duration = 0.0
-        self.status = "Initializing"
-        self.current_session_start = None
         
-        # Notification tracking
+        # Outage trackers
+        self.current_outage_start = time.time()
+        self.max_outage = 0.0
+        self.total_outage = 0.0
+        
+        # Notification state
         self.consecutive_errors = 0
         self.last_error_notify_time = 0.0
         self.in_error_state = False
@@ -55,12 +69,19 @@ class TunnelStats:
             if duration > self.max_duration:
                 self.max_duration = duration
         self.current_session_start = None
+        
+        # Start the outage timer if it isn't already running
+        if not self.current_outage_start:
+            self.current_outage_start = time.time()
 
-    @property
-    def avg_duration(self):
-        if self.success_count == 0: return 0.0
-        active = (time.time() - self.current_session_start) if self.current_session_start else 0
-        return (self.total_duration + active) / self.success_count
+    def record_connect(self):
+        if self.current_outage_start:
+            outage = time.time() - self.current_outage_start
+            self.total_outage += outage
+            if outage > self.max_outage:
+                self.max_outage = outage
+        self.current_outage_start = None
+        self.current_session_start = time.time()
 
 # --- HELP MODAL ---
 class HelpScreen(ModalScreen):
@@ -187,7 +208,6 @@ class TunnelApp(App):
         background: $background 80%;
     }
     
-    /* Shared flexible container for all Modals */
     #log_panel, #help_panel, #dialog {
         width: 90%; 
         max-width: 90;
@@ -296,13 +316,10 @@ class TunnelApp(App):
             time.sleep(2.5) 
             
             cmd = [
-                "ssh", "-N",
-                "-o", "ServerAliveInterval=10",     # Ping server every 10 seconds
-                "-o", "ServerAliveCountMax=2",      # Drop connection if 2 pings fail (20s max)
-                "-o", "ConnectTimeout=5",           # Give up connecting if it takes > 5 seconds
-                "-o", "ExitOnForwardFailure=yes",
+                "ssh",
                 "-o", "StrictHostKeyChecking=accept-new",
-                "-p", str(self.config["remote_port"])
+                "-p", str(self.config["remote_port"]),
+                f"{self.config['remote_user']}@{self.config['remote_ip']}"
             ]
             
             try:
@@ -349,23 +366,42 @@ class TunnelApp(App):
 
     def update_ui(self):
         is_connected = self.stats.current_session_start is not None
+        
+        # Calculate real-time active timers
+        app_runtime = max(0, time.time() - self.stats.app_start_time)
+        active_session = time.time() - self.stats.current_session_start if is_connected else 0.0
+        active_outage = time.time() - self.stats.current_outage_start if not is_connected else 0.0
+        
+        # Calculate cumulative totals
+        total_up = self.stats.total_duration + active_session
+        total_down = self.stats.total_outage + active_outage
+        
+        # Derived SLAs
+        uptime_pct = (total_up / app_runtime * 100) if app_runtime > 0 else 0.0
+        mtbf = total_up / max(1, self.stats.errors)
+        mttr = total_down / max(1, self.stats.errors)
+        max_outage_display = max(self.stats.max_outage, active_outage)
+
+        # Build the Table
         table = Table.grid(padding=(0, 2, 0, 0))
         table.add_column(style="bold magenta", justify="right")
         table.add_column(style="white")
         table.add_column(style="bold magenta", justify="right")
         table.add_column(style="white")
         
-        table.add_row("Attempts:", str(self.stats.attempts), "Successes:", str(self.stats.success_count))
-        table.add_row("Errors/Drops:", str(self.stats.errors), "First Link:", self.stats.first_success)
+        table.add_row("Engine Runtime:", fmt_time(app_runtime), "Uptime Ratio:", f"{uptime_pct:.3f}%")
+        table.add_row("Total Uptime:", fmt_time(total_up), "Total Downtime:", fmt_time(total_down))
+        table.add_row("Current Link:", fmt_time(active_session), "Longest Link:", fmt_time(max(self.stats.max_duration, active_session)))
+        table.add_row("Current Outage:", fmt_time(active_outage), "Longest Outage:", fmt_time(max_outage_display))
+        table.add_row("MTBF (Avg Up):", fmt_time(mtbf), "MTTR (Avg Down):", fmt_time(mttr))
         
-        curr_dur = time.time() - self.stats.current_session_start if is_connected else 0.0
-        table.add_row("Current Time:", f"{curr_dur:.1f}s", "Max Time:", f"{self.stats.max_duration:.1f}s")
-        table.add_row("Avg Time:", f"{self.stats.avg_duration:.1f}s", "Status:", f"[bold green]CONNECTED[/]" if is_connected else f"[bold red]{self.stats.status}[/]")
+        status_ui = "[bold green]CONNECTED[/]" if is_connected else f"[bold red]{self.stats.status}[/]"
+        table.add_row("Attempts/Drops:", f"{self.stats.attempts} / {self.stats.errors}", "Status:", status_ui)
 
         self.query_one("#stats_text", Static).update(table)
 
     def handle_connection_failure(self):
-        """Processes connection errors and triggers OS notifications if thresholds are met."""
+        self.stats.record_disconnect()
         self.stats.consecutive_errors += 1
         self.stats.errors += 1
         
@@ -380,7 +416,7 @@ class TunnelApp(App):
                 self.stats.in_error_state = True
 
     def handle_connection_success(self):
-        """Resets error state and notifies OS if recovering from an error state."""
+        self.stats.record_connect()
         if self.stats.in_error_state:
             send_os_notification(
                 "LLM Tunnel Restored", 
@@ -390,7 +426,6 @@ class TunnelApp(App):
             
         self.stats.consecutive_errors = 0
         self.stats.success_count += 1
-        self.stats.current_session_start = time.time()
         if self.stats.first_success == "N/A":
             self.stats.first_success = datetime.now().strftime("%H:%M:%S")
 
@@ -409,7 +444,9 @@ class TunnelApp(App):
             
             cmd = [
                 "ssh", "-N",
-                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveInterval=10",
+                "-o", "ServerAliveCountMax=2", 
+                "-o", "ConnectTimeout=5",
                 "-o", "ExitOnForwardFailure=yes",
                 "-o", "StrictHostKeyChecking=accept-new",
                 "-p", str(self.config["remote_port"])
@@ -439,21 +476,19 @@ class TunnelApp(App):
                 asyncio.create_task(read_stream(self.ssh_process.stdout))
                 asyncio.create_task(read_stream(self.ssh_process.stderr, True))
                 
+                # We give SSH exactly 6 seconds to prove it's stable.
                 try:
-                    # We give SSH exactly 6 seconds to prove it's stable.
-                    # Since ConnectTimeout is 5s, if it fails to connect, it will crash before this timeout.
                     await asyncio.wait_for(self.ssh_process.wait(), timeout=6.0)
-                    
-                    # If wait() completes before 6 seconds, the SSH process died prematurely.
+                    # If it exits before 6 seconds, the connection failed early.
                     self.log_msg(f"[bold red]Connection rejected or unreachable (Code: {self.ssh_process.returncode})[/bold red]")
                     self.handle_connection_failure()
                     
                 except asyncio.TimeoutError:
-                    # If it survives 6 seconds, it has successfully navigated the TCP handshake and is connected.
+                    # Connection survived the 6-second gauntlet. It is legitimate.
                     self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
                     self.handle_connection_success()
                     
-                    # Now block and wait indefinitely for the actual session to end
+                    # Wait indefinitely for the session to organically drop
                     await self.ssh_process.wait()
                     
                     if self.intentional_restart:
@@ -462,12 +497,10 @@ class TunnelApp(App):
                         continue
                         
                     self.log_msg(f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]")
-                    self.stats.record_disconnect()
                     self.handle_connection_failure()
                     
             except Exception as e:
                 self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
-                self.stats.record_disconnect()
                 self.handle_connection_failure()
                 
             self.stats.status = "Host Unreachable"
