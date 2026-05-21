@@ -2,14 +2,16 @@
 import os
 import json
 import time
-import subprocess
+import asyncio
 from datetime import datetime
-from rich.live import Live
-from rich.panel import Panel
-from rich.layout import Layout
+
+from textual.app import App, ComposeResult
+from textual.containers import Container
+from textual.widgets import Header, Footer, Static, DataTable, RichLog
+from textual.screen import ModalScreen, Screen
+from textual import work
+
 from rich.table import Table
-from rich.console import Console
-from rich.text import Text
 
 CONFIG_PATH = os.path.expanduser("~/.config/localai_tunnel.json")
 
@@ -34,138 +36,224 @@ class TunnelStats:
 
     @property
     def avg_duration(self):
-        if self.success_count == 0:
-            return 0.0
-        # If currently connected, include active session in average calculation
-        active_extra = (time.time() - self.current_session_start) if self.current_session_start else 0
-        return (self.total_duration + active_extra) / self.success_count
+        if self.success_count == 0: return 0.0
+        active = (time.time() - self.current_session_start) if self.current_session_start else 0
+        return (self.total_duration + active) / self.success_count
 
-def load_config():
-    try:
-        with open(CONFIG_PATH, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        return f"Error loading config from {CONFIG_PATH}: {str(e)}"
+# --- LOGGING MODAL ---
+class LogScreen(ModalScreen):
+    BINDINGS = [("l", "app.pop_screen", "Close Log"), ("escape", "app.pop_screen", "Close")]
 
-def make_layout() -> Layout:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="header", size=3),
-        Layout(name="body", ratio=1)
-    )
-    layout["body"].split_row(
-        Layout(name="stats", ratio=1),
-        Layout(name="services", ratio=1)
-    )
-    return layout
+    def compose(self) -> ComposeResult:
+        log_widget = RichLog(id="app_log", highlight=True, markup=True)
+        yield Container(log_widget, id="log_panel")
 
-def generate_dashboard(layout, config, stats):
-    # Header
-    is_connected = stats.current_session_start is not None
-    status_color = "bold green" if is_connected else "bold red"
-    status_text = "CONNECTED" if is_connected else stats.status
+# --- MAIN APP ---
+class TunnelApp(App):
+    CSS = """
+    Screen {
+        layout: grid;
+        grid-size: 2 1; /* 2 columns, 1 row on large screens */
+        grid-columns: 1fr 1fr;
+        padding: 1;
+    }
     
-    layout["header"].update(
-        Panel(
-            Text(f"▲ LOCAL LLM TUNNEL CONTROL ENGINE // STATUS: {status_text}", style=status_color, justify="center"),
-            border_style="cyan"
-        )
-    )
+    #stats_container, #services_container {
+        height: 100%;
+        border: round cyan;
+        padding: 1;
+    }
+    
+    #stats_container {
+        border: round magenta;
+        border-title-color: magenta;
+    }
 
-    # Stats Panel
-    stats_table = Table.grid(padding=(0, 1, 0, 1))
-    stats_table.add_column(style="bold magenta", justify="right")
-    stats_table.add_column(style="white")
+    #services_container {
+        border-title-color: cyan;
+    }
     
-    stats_table.add_row("Connection Attempts:", str(stats.attempts))
-    stats_table.add_row("Successful Connections:", str(stats.success_count))
-    stats_table.add_row("Dropped/Error Counts:", str(stats.errors))
-    stats_table.add_row("First Success Timestamp:", str(stats.first_success))
+    /* Responsive threshold for Termux/Mobile */
+    @media (max-width: 80) {
+        Screen {
+            grid-size: 1 2; /* 1 column, 2 rows on small screens */
+            grid-rows: 1fr 1fr;
+        }
+    }
     
-    if is_connected:
-        current_dur = time.time() - stats.current_session_start
-        stats_table.add_row("Current Session Time:", f"{current_dur:.1f}s")
-    else:
-        stats_table.add_row("Current Session Time:", "0.0s")
+    LogScreen {
+        align: center middle;
+        background: $background 80%; /* Dim background */
+    }
+    
+    #log_panel {
+        width: 90%;
+        height: 90%;
+        border: thick $primary;
+        background: $surface;
+    }
+    """
+
+    BINDINGS = [
+        ("l", "toggle_log", "Toggle Logs"),
+        ("q", "quit", "Quit App")
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.stats = TunnelStats()
+        self.config = self.load_config()
+        self.running = True
+
+    def load_config(self):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            return None
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
         
-    stats_table.add_row("Max Session Duration:", f"{stats.max_duration:.1f}s")
-    stats_table.add_row("Avg Session Duration:", f"{stats.avg_duration:.1f}s")
-
-    layout["stats"].update(Panel(stats_table, title="[bold telemetry]Session Diagnostics", border_style="magenta"))
-
-    # Services Panel
-    srv_table = Table(box=None, expand=True)
-    srv_table.add_column("Service", style="bold cyan")
-    srv_table.add_column("Local Map", style="green")
-    srv_table.add_column("Target Port", style="dim white")
-
-    if isinstance(config, dict):
-        for name, ports in config.get("services", {}).items():
-            srv_table.add_row(name.upper().replace("_", "-"), f"localhost:{ports['local']}", str(ports['remote']))
-    
-    layout["services"].update(Panel(srv_table, title="[bold network]Active Port Mappings", border_style="cyan"))
-
-def build_ssh_cmd(config):
-    cmd = ["ssh", "-N", "-o", "ServerAliveInterval=30", "-p", str(config["remote_port"])]
-    
-    # Map all services dynamically
-    for _, ports in config["services"].items():
-        cmd.extend(["-L", f"localhost:{ports['local']}:localhost:{ports['remote']}"])
+        # Stats pane
+        self.stats_widget = Static(id="stats_text")
+        stats_container = Container(self.stats_widget, id="stats_container")
+        stats_container.border_title = "Session Diagnostics"
+        yield stats_container
         
-    cmd.append(f"{config['remote_user']}@{config['remote_ip']}")
-    return cmd
+        # Services pane
+        self.services_table = DataTable(id="services_table")
+        srv_container = Container(self.services_table, id="services_container")
+        srv_container.border_title = "Active Port Mappings"
+        yield srv_container
+        
+        yield Footer()
 
-def main():
-    console = Console()
-    config = load_config()
-    
-    if isinstance(config, str):
-        console.print(f"[bold red]{config}[/bold red]")
-        return
+    def on_mount(self) -> None:
+        self.install_screen(LogScreen(), name="log_screen")
+        self.title = "▲ LOCAL LLM TUNNEL CONTROL ENGINE"
+        
+        # Setup DataTable
+        self.services_table.add_columns("Service", "Local Map", "Target Port")
+        if self.config:
+            for name, ports in self.config.get("services", {}).items():
+                self.services_table.add_row(
+                    name.upper().replace("_", "-"), 
+                    f"0.0.0.0:{ports['local']}", 
+                    str(ports['remote'])
+                )
 
-    stats = TunnelStats()
-    layout = make_layout()
+        # Start periodic UI refresh (10 times a second for smooth timers)
+        self.set_interval(0.1, self.update_ui)
+        
+        # Start background SSH loop
+        self.run_ssh_loop()
 
-    with Live(layout, refresh_per_second=4, screen=True) as live:
-        while True:
-            stats.attempts += 1
-            stats.status = "Routing..."
-            generate_dashboard(layout, config, stats)
+    def action_toggle_log(self) -> None:
+        self.push_screen("log_screen")
+
+    def log_msg(self, msg: str):
+        # Push to the RichLog widget safely
+        log_screen = self.screens.get("log_screen")
+        if log_screen:
+            logger = log_screen.query_one(RichLog)
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            self.call_from_thread(logger.write, f"[dim]{timestamp}[/dim] {msg}")
+
+    def update_ui(self):
+        is_connected = self.stats.current_session_start is not None
+        
+        # Format the 4-column Stats Table
+        table = Table.grid(padding=(0, 2, 0, 0))
+        table.add_column(style="bold magenta", justify="right")
+        table.add_column(style="white")
+        table.add_column(style="bold magenta", justify="right")
+        table.add_column(style="white")
+        
+        table.add_row("Attempts:", str(self.stats.attempts), "Successes:", str(self.stats.success_count))
+        table.add_row("Errors/Drops:", str(self.stats.errors), "First Link:", self.stats.first_success)
+        
+        curr_dur = time.time() - self.stats.current_session_start if is_connected else 0.0
+        table.add_row("Current Time:", f"{curr_dur:.1f}s", "Max Time:", f"{self.stats.max_duration:.1f}s")
+        table.add_row("Avg Time:", f"{self.stats.avg_duration:.1f}s", "Status:", f"[bold green]CONNECTED[/]" if is_connected else f"[bold red]{self.stats.status}[/]")
+
+        self.stats_widget.update(table)
+
+    @work(exclusive=True, thread=True)
+    async def run_ssh_loop(self):
+        if not self.config:
+            self.log_msg(f"[red]Error: Could not load config at {CONFIG_PATH}[/red]")
+            return
+
+        self.log_msg("[bold cyan]System Initialized. Starting routing loop...[/bold cyan]")
+
+        while self.running:
+            self.stats.attempts += 1
+            self.stats.status = "Routing..."
             
-            cmd = build_ssh_cmd(config)
+            cmd = [
+                "ssh", "-N",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ExitOnForwardFailure=yes", # CRITICAL: Crash if ports can't bind
+                "-o", "StrictHostKeyChecking=accept-new", # CRITICAL: Don't hang on new WAN IPs
+                "-p", str(self.config["remote_port"])
+            ]
+            
+            # Map ports safely: bind local 0.0.0.0, point to remote 127.0.0.1
+            for _, ports in self.config["services"].items():
+                cmd.extend(["-L", f"0.0.0.0:{ports['local']}:127.0.0.1:{ports['remote']}"])
+                
+            cmd.append(f"{self.config['remote_user']}@{self.config['remote_ip']}")
+            
+            self.log_msg(f"[yellow]Spawning Subprocess:[/yellow] {' '.join(cmd)}")
             
             try:
-                # Run the SSH command asynchronously
-                process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                # Run async to capture stream outputs natively
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
                 
-                # Tiny grace period to catch instant auth errors
-                time.sleep(1.5)
-                if process.poll() is not None:
-                    raise subprocess.SubprocessError("SSH handshake rejected.")
+                # Async functions to read the SSH stdout/stderr streams to our logger
+                async def read_stream(stream, is_stderr=False):
+                    while True:
+                        line = await stream.readline()
+                        if not line: break
+                        color = "red" if is_stderr else "dim white"
+                        self.log_msg(f"[{color}][SSH] {line.decode().strip()}[/{color}]")
+
+                asyncio.create_task(read_stream(process.stdout))
+                asyncio.create_task(read_stream(process.stderr, True))
                 
-                # Connection successful
-                stats.success_count += 1
-                if stats.first_success == "N/A":
-                    stats.first_success = datetime.now().strftime("%H:%M:%S")
-                stats.current_session_start = time.time()
-                
-                # Hold loop while process runs
-                while process.poll() is None:
-                    generate_dashboard(layout, config, stats)
-                    time.sleep(0.25)
+                # Check for instant failure
+                await asyncio.sleep(1.5)
+                if process.returncode is not None:
+                    self.log_msg(f"[bold red]SSH process died immediately with code {process.returncode}[/bold red]")
+                    self.stats.errors += 1
+                else:
+                    self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
+                    self.stats.success_count += 1
+                    self.stats.current_session_start = time.time()
+                    if self.stats.first_success == "N/A":
+                        self.stats.first_success = datetime.now().strftime("%H:%M:%S")
                     
-                stats.record_disconnect()
-                stats.errors += 1
-                stats.status = "Link Dropped"
+                    # Await process exit
+                    await process.wait()
+                    self.log_msg(f"[red]Link dropped (Code: {process.returncode})[/red]")
+                    self.stats.record_disconnect()
+                    self.stats.errors += 1
+                    
+            except Exception as e:
+                self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
+                self.stats.record_disconnect()
+                self.stats.errors += 1
                 
-            except Exception:
-                stats.record_disconnect()
-                stats.errors += 1
-                stats.status = "Host Unreachable"
-                
-            generate_dashboard(layout, config, stats)
-            time.sleep(5)
+            self.stats.status = "Host Unreachable"
+            self.log_msg("[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]")
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    main()
+    app = TunnelApp()
+    app.run()
 
