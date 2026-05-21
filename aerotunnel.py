@@ -17,6 +17,142 @@ from rich.table import Table
 
 CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
 
+def load_json_with_comments(filepath):
+    import re
+    with open(filepath, 'r') as f:
+        content = f.read()
+    
+    # Remove // and /* */ comments
+    pattern = r'("(?:\\.|[^"\\])*")|//.*|/\*[\s\S]*?\*/'
+    def replacer(match):
+        if match.group(1):
+            return match.group(1)
+        else:
+            return ""
+    clean_content = re.sub(pattern, replacer, content)
+    
+    # Remove # comments
+    pattern_hash = r'("(?:\\.|[^"\\])*")|#.*'
+    def replacer_hash(match):
+        if match.group(1):
+            return match.group(1)
+        else:
+            return ""
+    clean_content = re.sub(pattern_hash, replacer_hash, clean_content)
+    
+    return json.loads(clean_content)
+
+def create_boilerplate_config(filepath):
+    boilerplate = """// ============================================================================
+// ▲ AEROTUNNEL CONFIGURATION TEMPLATE
+// ============================================================================
+// Use this file to configure your local SSH tunnel to your remote LLM or services.
+// Comments (single-line // or #, block /* */) are fully supported!
+// ============================================================================
+{
+  // The IP address or domain name of your remote server (e.g., "192.168.1.100" or "ssh.myllm.server")
+  "remote_ip": "127.0.0.1",
+
+  // The SSH username for logging into your remote server
+  "remote_user": "change_me",
+
+  // The SSH port of your remote server (default is 22)
+  "remote_port": 22,
+
+  // Services to forward through the secure SSH tunnel.
+  // Each service has:
+  //   - "local": the port opened on your local machine to access the service
+  //   - "remote": the port on the remote machine where the service is running
+  "services": {
+    // Ollama AI Service (Default: local 11434 -> remote 11434)
+    "ollama": {
+      "local": 11434,
+      "remote": 11434
+    },
+    // Open WebUI / Gradio interface (Default: local 3000 -> remote 8080)
+    "webui": {
+      "local": 3000,
+      "remote": 8080
+    }
+  }
+}
+"""
+    with open(filepath, 'w') as f:
+        f.write(boilerplate)
+
+def open_editor(filepath):
+    editors = []
+    
+    # Try environment variables first
+    if os.environ.get("VISUAL"):
+        editors.append(os.environ.get("VISUAL"))
+    if os.environ.get("EDITOR"):
+        editors.append(os.environ.get("EDITOR"))
+        
+    # Standard terminal editors prioritized
+    standard_editors = [
+        "nvim", "vim", "nano", "pico", "micro", 
+        "emacs", "vi", "joe", "ee", "mcedit"
+    ]
+    if os.name == 'nt':
+        standard_editors.extend(["notepad.exe", "notepad"])
+        
+    for ed in standard_editors:
+        if ed not in editors:
+            editors.append(ed)
+            
+    success = False
+    for editor in editors:
+        cmd_parts = editor.split()
+        binary = cmd_parts[0]
+        resolved_binary = shutil.which(binary)
+        if resolved_binary:
+            cmd = [resolved_binary] + cmd_parts[1:] + [filepath]
+            if binary == "emacs" and len(cmd_parts) == 1:
+                cmd = [resolved_binary, "-nw", filepath]
+            try:
+                subprocess.run(cmd)
+                success = True
+                break
+            except Exception:
+                continue
+                
+    if not success:
+        print(f"\n[!] Error: Could not launch any terminal-based text editor automatically.")
+        print(f"    Please manually edit/create the configuration file at:")
+        print(f"    {filepath}\n")
+        input("Press Enter to continue once you have created/edited the file...")
+
+def check_config_on_startup():
+    config_dir = os.path.dirname(CONFIG_PATH)
+    if not os.path.exists(config_dir):
+        try:
+            os.makedirs(config_dir, exist_ok=True)
+        except Exception as e:
+            print(f"Error creating config directory: {e}")
+            
+    if not os.path.exists(CONFIG_PATH):
+        print("\n\033[1;36m▲ WELCOME TO AEROTUNNEL\033[0m")
+        print("\033[1;33mConfiguration file not found. Creating a boilerplate template...\033[0m")
+        create_boilerplate_config(CONFIG_PATH)
+        time.sleep(1.5)
+        
+        while True:
+            print(f"\nOpening {CONFIG_PATH} in your text editor...")
+            time.sleep(1.0)
+            open_editor(CONFIG_PATH)
+            
+            try:
+                load_json_with_comments(CONFIG_PATH)
+                print("\n\033[1;32m[✓] Configuration parsed successfully!\033[0m")
+                time.sleep(1.0)
+                break
+            except Exception as e:
+                print(f"\n\033[1;31m[!] Error parsing configuration file:\033[0m {e}")
+                ans = input("Would you like to reopen the editor to fix the error? [Y/n]: ").strip().lower()
+                if ans == 'n':
+                    break
+
 # --- CONFIGURABLE NOTIFICATION SETTINGS ---
 NOTIFICATION_FAIL_THRESHOLD = 5
 NOTIFICATION_COOLDOWN_SEC = 3600  # 1 hour
@@ -85,7 +221,6 @@ class TunnelStats:
 # --- HELP MODAL ---
 class HelpScreen(ModalScreen):
     BINDINGS = [("escape", "app.pop_screen", "Close"), ("h", "app.pop_screen", "Close")]
-    
     def compose(self) -> ComposeResult:
         help_text = """[bold cyan]▲ LOCAL LLM TUNNEL // HELP & CONTROLS[/bold cyan]
 
@@ -99,6 +234,9 @@ class HelpScreen(ModalScreen):
 • [yellow]s[/yellow] : Interactive Shell
   [dim]Suspends the UI and drops you into a native terminal session on the remote server.[/dim]
   [bold red]CRITICAL:[/bold red] Type 'exit' or press [bold]Ctrl+D[/bold] in the remote shell to return to this dashboard!
+
+• [yellow]c[/yellow] : Edit Configuration
+  [dim]Pauses the TUI and opens the configuration file in your preferred editor. The tunnel restarts automatically after exit.[/dim]
 
 • [yellow]h[/yellow] : Show this Help dialog
 
@@ -225,6 +363,7 @@ class TunnelApp(App):
         ("b", "configure_bindings", "Bindings"),
         ("l", "toggle_log", "Logs"),
         ("s", "open_shell", "Shell"),
+        ("c", "edit_config", "Config"),
         ("q", "quit", "Quit")
     ]
 
@@ -245,8 +384,7 @@ class TunnelApp(App):
 
     def load_config(self):
         try:
-            with open(CONFIG_PATH, "r") as f:
-                return json.load(f)
+            return load_json_with_comments(CONFIG_PATH)
         except Exception:
             return None
 
@@ -327,6 +465,34 @@ class TunnelApp(App):
                 print(f"Shell error: {e}")
                 
             time.sleep(0.5) 
+
+    def action_edit_config(self) -> None:
+        with self.suspend():
+            os.system('cls' if os.name == 'nt' else 'clear')
+            print("\n\033[1;36m▲ LOCAL LLM TUNNEL // EDIT CONFIGURATION\033[0m")
+            print("\033[1;31m============================================================\033[0m")
+            print("\033[1;33m REMINDER: Save and quit your editor to return to the TUI.  \033[0m")
+            print("\033[1;31m============================================================\033[0m\n")
+            
+            time.sleep(1.0)
+            open_editor(CONFIG_PATH)
+            time.sleep(0.5)
+
+        new_config = self.load_config()
+        if new_config:
+            self.config = new_config
+            
+            # Re-initialize and update service bindings
+            new_bindings = {}
+            for srv in self.config.get("services", {}).keys():
+                new_bindings[srv] = self.service_bindings.get(srv, "127.0.0.1")
+            self.service_bindings = new_bindings
+            
+            self.update_services_table()
+            self.log_msg("[yellow]Configuration reloaded. Restarting SSH tunnel...[/yellow]")
+            self.restart_tunnel()
+        else:
+            self.log_msg("[bold red]Failed to reload config: invalid JSON or missing file.[/bold red]")
 
     @work
     async def action_configure_bindings(self) -> None:
@@ -512,5 +678,6 @@ class TunnelApp(App):
                 pass
 
 if __name__ == "__main__":
+    check_config_on_startup()
     app = TunnelApp()
     app.run()
