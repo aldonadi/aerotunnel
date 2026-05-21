@@ -237,8 +237,8 @@ class TunnelApp(App):
             self.sleep_task.cancel()
 
     def log_msg(self, msg: str):
-        log_screen = self.screens.get("log_screen")
-        if log_screen:
+        if self.is_screen_installed("log_screen"):
+            log_screen = self.get_screen("log_screen")
             logger = log_screen.query_one(RichLog)
             timestamp = datetime.now().strftime("%H:%M:%S")
             self.call_from_thread(logger.write, f"[dim]{timestamp}[/dim] {msg}")
