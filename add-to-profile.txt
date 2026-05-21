@@ -1,0 +1,7 @@
+# Reuse persistent ssh-agent environments across Termux windows
+export SSH_AUTH_SOCK=$TERMUX_APP_PID/ssh-agent.socket
+if [ ! -S "$SSH_AUTH_SOCK" ]; then
+    eval $(ssh-agent -a "$SSH_AUTH_SOCK") > /dev/null
+fi
+
+
