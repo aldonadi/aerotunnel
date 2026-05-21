@@ -97,6 +97,12 @@ class LogScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         yield Container(RichLog(id="app_log", highlight=True, markup=True), id="log_panel")
 
+    def on_mount(self) -> None:
+        logger = self.query_one(RichLog)
+        # Flush the app's memory buffer into the UI
+        for msg in getattr(self.app, "log_history", []):
+            logger.write(msg)
+
 # --- MAIN APP ---
 class TunnelApp(App):
     CSS = """
@@ -156,6 +162,11 @@ class TunnelApp(App):
         self.ssh_process = None
         self.intentional_restart = False
         self.sleep_task = None
+
+        # logging temp buffer, to handle race cconditions
+        # where the logfer tries to log before the UI is
+        # fully initialized
+        self.log_history = []
         
         # Initialize default bindings to secure localhost
         self.service_bindings = {}
@@ -237,11 +248,23 @@ class TunnelApp(App):
             self.sleep_task.cancel()
 
     def log_msg(self, msg: str):
-        if self.is_screen_installed("log_screen"):
-            log_screen = self.get_screen("log_screen")
-            logger = log_screen.query_one(RichLog)
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.call_from_thread(logger.write, f"[dim]{timestamp}[/dim] {msg}")
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        formatted_msg = f"[dim]{timestamp}[/dim] {msg}"
+        
+        # Save to memory buffer (keep last 500 lines to prevent memory bloat)
+        self.log_history.append(formatted_msg)
+        if len(self.log_history) > 500:
+            self.log_history.pop(0)
+            
+        # Safely attempt to write to the UI if it exists
+        try:
+            if self.is_screen_installed("log_screen"):
+                log_screen = self.get_screen("log_screen")
+                logger = log_screen.query_one(RichLog)
+                self.call_from_thread(logger.write, formatted_msg)
+        except Exception:
+            # Widget isn't fully drawn yet; ignore and let on_mount handle it later
+            pass
 
     def update_ui(self):
         is_connected = self.stats.current_session_start is not None
