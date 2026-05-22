@@ -11,12 +11,21 @@ Built on top of Python's modern async **Textual** framework and powered by **Ric
 ## Key Features
 
 - 📊 **Session Diagnostics Panel**: Tracks total uptime, link survival time, network outage tracking, drops, and industry-grade SLAs (Uptime Ratio, MTBF, MTTR).
-- 🔗 **Active Port Mappings**: Tabular view of all forwarded services, local address maps, and remote destination ports.
+- 🔗 **Active Port Mappings with Per-Service Status**: Displays a tabular view of all forwarded services, local address maps, target ports, and real-time connectivity status (`✔️ ACTIVE`, `❌ PORT IN USE`, or `⏳ PENDING`).
+- ⚡ **Degraded / Partial Connection Handling**: If some local ports are occupied, Aerotunnel will not fail. Instead, it drops a desktop notification, flags the blocked ports as `❌ PORT IN USE`, and successfully tunnels the remaining working services in a robust `DEGRADED` state.
+- 🎯 **Specific Connection Error Diagnostics**: Instead of a generic offline message, Aerotunnel intercepts verbatim SSH stderr streams to diagnose exact failure modes:
+  * `Auth Failure` (bad key/password)
+  * `Conn Refused` (remote server port closed)
+  * `Host Unreachable` (network route offline)
+  * `Timed Out` (remote host unresponsive)
+  * `DNS Failure` (unresolved remote hostname)
+  * `All Ports In Use` (every requested local port is blocked)
+- 🔁 **Instant Reconnect Hotkey**: A global `r` key lets you drop all active links, reset statuses, and immediately force a full connection retry (highly useful after manually freeing up local port conflicts).
 - ⚙️ **On-the-fly Binding Customization**: Interactive modal (`b` key) to selectively bind individual services to local-only (`127.0.0.1`) or expose them to your local network (`0.0.0.0`) dynamically.
 - 🛠️ **In-App Config Editor**: Zero-friction config management (`c` key) that pauses the UI, lets you edit the configuration file with your preferred text editor (using a robust fallback editor chain), validates JSON structure upon exiting, and restarts your tunnel.
 - 💬 **Interactive Shell suspension**: Suspends the TUI and safely drops you into a native SSH interactive terminal session on the remote server (`s` key).
-- 🔔 **OS Notifications**: Smart notification alerts (via `notify-send` on desktop Linux/BSD or `termux-notification` on Android Termux) that trigger on threshold-based disconnect outages.
-- 📝 **Live Logs View**: Access raw SSH output logs buffer (`l` key) in real-time, built right into a dedicated overlay screen for debugging connection issues.
+- 🔔 **OS Notifications**: Smart notification alerts (via `notify-send` on desktop Linux/BSD or `termux-notification` on Android Termux) that trigger on connection drops or degraded states.
+- 📝 **Live Logs View**: Access raw, verbatim SSH output logs buffer (`l` key) in real-time, built right into a dedicated overlay screen for debugging connection issues.
 - 💬 **Comment-Supported Configuration**: Configuration files natively support single-line (`//`, `#`) and multi-line (`/* */`) comments for beautiful self-documenting parameters.
 
 ---
@@ -32,6 +41,7 @@ When running Aerotunnel, control your operations space with the following global
 | `l` | **View System Logs** | Opens the raw SSH output and connection lifecycle logs stream. |
 | `s` | **Interactive Shell** | Suspends TUI, opens an active SSH shell session on the host. Exit shell (`exit` or `Ctrl+D`) to return to the TUI. |
 | `c` | **Edit Configuration** | Suspends TUI, opens the active configuration file in your terminal's preferred editor. Reloads and restarts tunnel on exit. |
+| `r` | **Retry Connections** | Drops all active links, resets statuses to `⏳ PENDING`, and immediately triggers a fresh connection retry. |
 | `q` | **Quit Application** | Gracefully cleans up subprocesses, terminates tunnels, and exits. |
 
 ---
@@ -40,16 +50,41 @@ When running Aerotunnel, control your operations space with the following global
 
 ### Prerequisites
 
-- **Python**: `>= 3.12`
+- **Python**: `>= 3.9`
 - **SSH Client**: `ssh` executable present in your system's PATH.
-- **Dependencies**: Managed via Python dependencies (e.g., `textual`).
 
-### Quick Start
+### Modern Global Installation (Recommended)
 
-Initialize the application by running:
+Aerotunnel is packaged to support zero-dependency global installation via **`uv`** or **`pipx`**. This registers `aerotunnel` directly to your terminal's `$PATH` so you can launch it from any directory without managing virtual environments or dependencies manually.
 
 ```bash
-python aerotunnel.py
+# 1. Install globally using uv
+uv tool install .
+
+# Or using pipx
+pipx install .
+```
+
+You can now run Aerotunnel instantly from anywhere by typing:
+```bash
+aerotunnel
+```
+
+*To install in **editable** mode (where your local changes to `aerotunnel.py` take effect immediately without reinstallation):*
+```bash
+uv tool install --editable .
+```
+
+### Manual Development Setup
+
+If you prefer to run it manually using a virtual environment:
+
+```bash
+# 1. Clone the repository and navigate inside
+cd aerotunnel
+
+# 2. Run using uv
+uv run aerotunnel.py
 ```
 
 ### Automatic Bootstrap & Configuration Setup
@@ -100,11 +135,11 @@ Here is an example config:
 
 ---
 
-## Diagnostics & SLA SLA Metrics Explained
+## Diagnostics & SLA Metrics Explained
 
 Aerotunnel calculates system-critical routing telemetry in real-time:
 - **Engine Runtime**: Total elapsed time since the TUI was launched.
-- **Uptime Ratio**: Percentage of engine runtime where active SSH tunnel routing was fully functional.
+- **Uptime Ratio**: Percentage of engine runtime where active SSH tunnel routing was fully functional (displays with up to five 9's of precision, e.g. `99.99900%`).
 - **MTBF (Mean Time Between Failures)**: Average duration of a stable link connection before experiencing a drop.
 - **MTTR (Mean Time To Recovery)**: Average duration of an outage before the connection is successfully re-established.
 - **Current Link / Outage**: Real-time counters showing the length of the active connection session or the length of the current connection outage.
