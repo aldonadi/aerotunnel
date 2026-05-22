@@ -245,6 +245,9 @@ class HelpScreen(ModalScreen):
 • [yellow]c[/yellow] : Edit Configuration
   [dim]Pauses the TUI and opens the configuration file in your preferred editor. The tunnel restarts automatically after exit.[/dim]
 
+• [yellow]r[/yellow] : Retry connections
+  [dim]Drops all active connections and reattempts to bind all configured services (useful after manually freeing blocked ports).[/dim]
+
 • [yellow]h[/yellow] : Show this Help dialog
 
 • [yellow]q[/yellow] : Quit application
@@ -377,6 +380,7 @@ class TunnelApp(App):
         ("l", "toggle_log", "Logs"),
         ("s", "open_shell", "Shell"),
         ("c", "edit_config", "Config"),
+        ("r", "retry_connections", "Retry"),
         ("q", "quit", "Quit")
     ]
 
@@ -391,9 +395,13 @@ class TunnelApp(App):
         self.log_history = []
         
         self.service_bindings = {}
+        self.service_statuses = {}
+        self.is_partial_mode = False
+        self.active_services_to_bind = []
         if self.config:
             for srv in self.config.get("services", {}).keys():
                 self.service_bindings[srv] = "127.0.0.1"
+                self.service_statuses[srv] = "pending"
 
     def load_config(self):
         try:
@@ -441,16 +449,26 @@ class TunnelApp(App):
     def update_services_table(self):
         table = self.query_one("#services_table", DataTable)
         table.clear(columns=True)
-        table.add_columns("Service", "Local Map", "Target Port")
+        table.add_columns("Service", "Local Map", "Target Port", "Status")
         
         if self.config:
             for name, ports in self.config.get("services", {}).items():
                 bind_ip = self.service_bindings.get(name, "127.0.0.1")
                 bind_display = f"[bold white on red] 0.0.0.0 [/]" if bind_ip == "0.0.0.0" else f"[bold green]{bind_ip}[/]"
+                
+                status_val = self.service_statuses.get(name, "pending")
+                if status_val == "active":
+                    status_display = "[bold green]✔️ ACTIVE[/]"
+                elif status_val == "failed_port_in_use":
+                    status_display = "[bold red]❌ PORT IN USE[/]"
+                else:
+                    status_display = "[bold yellow]⏳ PENDING[/]"
+                
                 table.add_row(
                     name.upper().replace("_", "-"), 
                     f"{bind_display}:{ports['local']}", 
-                    str(ports['remote'])
+                    str(ports['remote']),
+                    status_display
                 )
 
     def action_show_help(self) -> None:
@@ -503,12 +521,16 @@ class TunnelApp(App):
         new_config = self.load_config()
         if new_config:
             self.config = new_config
+            self.is_partial_mode = False
             
-            # Re-initialize and update service bindings
+            # Re-initialize and update service bindings & statuses
             new_bindings = {}
+            new_statuses = {}
             for srv in self.config.get("services", {}).keys():
                 new_bindings[srv] = self.service_bindings.get(srv, "127.0.0.1")
+                new_statuses[srv] = "pending"
             self.service_bindings = new_bindings
+            self.service_statuses = new_statuses
             
             self.update_services_table()
             self.log_msg("[yellow]Configuration reloaded. Restarting SSH tunnel...[/yellow]")
@@ -527,6 +549,7 @@ class TunnelApp(App):
 
     def restart_tunnel(self):
         self.intentional_restart = True
+        self.is_partial_mode = False
         if self.ssh_process:
             try:
                 self.ssh_process.terminate()
@@ -534,6 +557,17 @@ class TunnelApp(App):
                 pass
         if self.sleep_task:
             self.sleep_task.cancel()
+
+    def action_retry_connections(self) -> None:
+        self.log_msg("[yellow]User requested connection retry. Resetting and dropping active links...[/yellow]")
+        
+        # Reset all service statuses to pending
+        if self.config:
+            for srv in self.config.get("services", {}).keys():
+                self.service_statuses[srv] = "pending"
+        self.update_services_table()
+        
+        self.restart_tunnel()
 
     def log_msg(self, msg: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -589,7 +623,14 @@ class TunnelApp(App):
         table.add_row("Current Outage:", fmt_time(active_outage), "Longest Outage:", fmt_time(max_outage_display))
         table.add_row("MTBF (Avg Up):", fmt_time(mtbf), "MTTR (Avg Down):", fmt_time(mttr))
         
-        status_ui = "[bold green]CONNECTED[/]" if is_connected else f"[bold red]{self.stats.status}[/]"
+        if is_connected:
+            if self.is_partial_mode or self.stats.status in ["DEGRADED", "PARTIAL"]:
+                status_ui = f"[bold yellow]{self.stats.status}[/]"
+            else:
+                status_ui = "[bold green]CONNECTED[/]"
+        else:
+            status_ui = f"[bold red]{self.stats.status}[/]"
+            
         table.add_row("Attempts/Drops:", f"{self.stats.attempts} / {self.stats.errors}", "Status:", status_ui)
 
         self.query_one("#stats_text", Static).update(table)
@@ -634,20 +675,28 @@ class TunnelApp(App):
         try:
             while self.running:
                 self.intentional_restart = False
+                
+                # If not in partial mode, this is a fresh attempt to bind all configured services
+                if not self.is_partial_mode:
+                    self.stats.status = "Routing..."
+                    for srv in self.config["services"].keys():
+                        self.service_statuses[srv] = "pending"
+                    self.active_services_to_bind = list(self.config["services"].keys())
+                    self.update_services_table()
+                
                 self.stats.attempts += 1
-                self.stats.status = "Routing..."
                 
                 cmd = [
                     "ssh", "-N",
                     "-o", "ServerAliveInterval=10",
                     "-o", "ServerAliveCountMax=2", 
                     "-o", "ConnectTimeout=5",
-                    "-o", "ExitOnForwardFailure=yes",
                     "-o", "StrictHostKeyChecking=accept-new",
                     "-p", str(self.config["remote_port"])
                 ]
                 
-                for srv_name, ports in self.config["services"].items():
+                for srv_name in self.active_services_to_bind:
+                    ports = self.config["services"][srv_name]
                     bind_ip = self.service_bindings.get(srv_name, "127.0.0.1")
                     cmd.extend(["-L", f"{bind_ip}:{ports['local']}:127.0.0.1:{ports['remote']}"])
                     
@@ -661,12 +710,16 @@ class TunnelApp(App):
                         stderr=asyncio.subprocess.PIPE
                     )
                     
+                    stderr_lines = []
                     async def read_stream(stream, is_stderr=False):
                         while True:
                             line = await stream.readline()
                             if not line: break
+                            line_str = line.decode().strip()
+                            if is_stderr:
+                                stderr_lines.append(line_str)
                             color = "red" if is_stderr else "dim white"
-                            self.log_msg(f"[{color}][SSH] {line.decode().strip()}[/{color}]")
+                            self.log_msg(f"[{color}][SSH] {line_str}[/{color}]")
 
                     asyncio.create_task(read_stream(self.ssh_process.stdout))
                     asyncio.create_task(read_stream(self.ssh_process.stderr, True))
@@ -674,31 +727,146 @@ class TunnelApp(App):
                     # We give SSH exactly 6 seconds to prove it's stable.
                     try:
                         await asyncio.wait_for(self.ssh_process.wait(), timeout=6.0)
+                        
                         # If it exits before 6 seconds, the connection failed early.
-                        self.log_msg(f"[bold red]Connection rejected or unreachable (Code: {self.ssh_process.returncode})[/bold red]")
+                        err_msg = "Connection rejected or unreachable"
+                        status_str = "Host Unreachable"
+                        
+                        stderr_content = "\n".join(stderr_lines).lower()
+                        if "permission denied" in stderr_content:
+                            status_str = "Auth Failure"
+                            err_msg = "Permission denied (auth failure)"
+                        elif "connection refused" in stderr_content:
+                            status_str = "Conn Refused"
+                            err_msg = "Connection refused by remote host"
+                        elif "no route to host" in stderr_content or "destination host unreachable" in stderr_content or "network is unreachable" in stderr_content:
+                            status_str = "Host Unreachable"
+                            err_msg = "Host unreachable / No route to host"
+                        elif "timed out" in stderr_content:
+                            status_str = "Timed Out"
+                            err_msg = "Connection timed out"
+                        elif "could not resolve hostname" in stderr_content or "name or service not known" in stderr_content:
+                            status_str = "DNS Failure"
+                            err_msg = "Could not resolve remote hostname"
+                        elif "address already in use" in stderr_content or "cannot listen to port" in stderr_content:
+                            status_str = "All Ports In Use"
+                            err_msg = "All requested local ports are already in use"
+                            
+                        self.log_msg(f"[bold red]{err_msg} (Code: {self.ssh_process.returncode})[/bold red]")
+                        
+                        # Mark all requested services as blocked if we got All Ports In Use
+                        if status_str == "All Ports In Use" or "address already in use" in stderr_content:
+                            for srv in self.active_services_to_bind:
+                                self.service_statuses[srv] = "failed_port_in_use"
+                            self.update_services_table()
+                            
+                        self.stats.status = status_str
                         self.handle_connection_failure()
                         
                     except asyncio.TimeoutError:
-                        # Connection survived the 6-second gauntlet. It is legitimate.
-                        self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
-                        self.handle_connection_success()
+                        # Connection survived the 6-second timeout.
+                        # Parse stderr to see if any requested ports failed to bind.
+                        local_ports_to_service = {
+                            ports["local"]: srv for srv, ports in self.config["services"].items()
+                            if srv in self.active_services_to_bind
+                        }
+                        failed_ports = set()
                         
-                        # Wait indefinitely for the session to organically drop
-                        await self.ssh_process.wait()
-                        
-                        if self.intentional_restart:
-                            self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
-                            self.stats.record_disconnect()
-                            continue
+                        import re
+                        for line in stderr_lines:
+                            if "address already in use" in line.lower() or "cannot listen to port" in line.lower():
+                                digits = re.findall(r"\b\d{2,5}\b", line)
+                                for d in digits:
+                                    p = int(d)
+                                    if p in local_ports_to_service:
+                                        failed_ports.add(p)
+                                        
+                        # If some ports were already in use
+                        if failed_ports and not self.is_partial_mode:
+                            failed_services = []
+                            successful_services = []
                             
-                        self.log_msg(f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]")
-                        self.handle_connection_failure()
-                        
+                            for srv_name in self.active_services_to_bind:
+                                p = self.config["services"][srv_name]["local"]
+                                if p in failed_ports:
+                                    self.service_statuses[srv_name] = "failed_port_in_use"
+                                    failed_services.append(srv_name)
+                                else:
+                                    self.service_statuses[srv_name] = "active"
+                                    successful_services.append(srv_name)
+                                    
+                            self.update_services_table()
+                            
+                            # Terminate the first SSH command so we can redo it with only working ports
+                            if self.ssh_process:
+                                try:
+                                    self.ssh_process.terminate()
+                                except Exception:
+                                    pass
+                                    
+                            if not successful_services:
+                                # All ports were blocked
+                                self.log_msg("[bold red]All requested local ports are already in use.[/bold red]")
+                                self.stats.status = "All Ports In Use"
+                                self.handle_connection_failure()
+                            else:
+                                # Succeeded for some, failed for others!
+                                self.log_msg(f"[bold yellow]Partial connection established. Active: {successful_services}. Blocked: {failed_services}[/bold yellow]")
+                                
+                                # Log the warning lines verbatim
+                                for line in stderr_lines:
+                                    if "address already in use" in line.lower() or "cannot listen to port" in line.lower():
+                                        self.log_msg(f"[bold red][PORT WARNING] {line}[/bold red]")
+                                        
+                                # Send desktop notification
+                                notify_details = ", ".join([f"{srv} ({self.config['services'][srv]['local']})" for srv in failed_services])
+                                send_os_notification(
+                                    "LLM Tunnel Degraded",
+                                    f"Connected partially. Ports already in use: {notify_details}"
+                                )
+                                
+                                # Switch to partial mode and continue to restart the connection with only successful ports
+                                self.is_partial_mode = True
+                                self.active_services_to_bind = successful_services
+                                self.stats.status = "DEGRADED"
+                                continue
+                        else:
+                            # Succeeded completely for all requested ports
+                            for srv_name in self.active_services_to_bind:
+                                self.service_statuses[srv_name] = "active"
+                            self.update_services_table()
+                            
+                            if self.is_partial_mode:
+                                self.stats.status = "DEGRADED"
+                                self.log_msg("[bold yellow]Degraded Link Established. Working ports are hot.[/bold yellow]")
+                            else:
+                                self.stats.status = "CONNECTED"
+                                self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
+                                
+                            self.handle_connection_success()
+                            
+                            # Wait indefinitely for the session to organically drop
+                            await self.ssh_process.wait()
+                            
+                            if self.intentional_restart:
+                                self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
+                                self.stats.record_disconnect()
+                                continue
+                                
+                            self.log_msg(f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]")
+                            self.handle_connection_failure()
+                            self.is_partial_mode = False  # Reset on drop
+                            
                 except Exception as e:
                     self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
                     self.handle_connection_failure()
+                    self.is_partial_mode = False
                     
-                self.stats.status = "Host Unreachable"
+                if self.is_partial_mode:
+                    self.stats.status = "DEGRADED"
+                elif not self.stats.status or self.stats.status in ["CONNECTED", "Routing..."]:
+                    self.stats.status = "Host Unreachable"
+                    
                 self.log_msg("[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]")
                 
                 try:
