@@ -20,34 +20,41 @@ CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
 # Version Information
 MAJOR = 0
 MINOR = 2
-PATCH = 0
+PATCH = 2
 VERSION = f"{MAJOR}.{MINOR}.{PATCH}"
 DATE_RELEASED = "2026-05-21"
 
+
 def load_json_with_comments(filepath):
     import re
-    with open(filepath, 'r') as f:
+
+    with open(filepath, "r") as f:
         content = f.read()
-    
+
     # Remove // and /* */ comments
     pattern = r'("(?:\\.|[^"\\])*")|//.*|/\*[\s\S]*?\*/'
+
     def replacer(match):
         if match.group(1):
             return match.group(1)
         else:
             return ""
+
     clean_content = re.sub(pattern, replacer, content)
-    
+
     # Remove # comments
     pattern_hash = r'("(?:\\.|[^"\\])*")|#.*'
+
     def replacer_hash(match):
         if match.group(1):
             return match.group(1)
         else:
             return ""
+
     clean_content = re.sub(pattern_hash, replacer_hash, clean_content)
-    
+
     return json.loads(clean_content)
+
 
 def create_boilerplate_config(filepath):
     boilerplate = """// ============================================================================
@@ -84,30 +91,39 @@ def create_boilerplate_config(filepath):
   }
 }
 """
-    with open(filepath, 'w') as f:
+    with open(filepath, "w") as f:
         f.write(boilerplate)
+
 
 def open_editor(filepath):
     editors = []
-    
+
     # Try environment variables first
     if os.environ.get("VISUAL"):
         editors.append(os.environ.get("VISUAL"))
     if os.environ.get("EDITOR"):
         editors.append(os.environ.get("EDITOR"))
-        
+
     # Standard terminal editors prioritized
     standard_editors = [
-        "nvim", "vim", "nano", "pico", "micro", 
-        "emacs", "vi", "joe", "ee", "mcedit"
+        "nvim",
+        "vim",
+        "nano",
+        "pico",
+        "micro",
+        "emacs",
+        "vi",
+        "joe",
+        "ee",
+        "mcedit",
     ]
-    if os.name == 'nt':
+    if os.name == "nt":
         standard_editors.extend(["notepad.exe", "notepad"])
-        
+
     for ed in standard_editors:
         if ed not in editors:
             editors.append(ed)
-            
+
     success = False
     for editor in editors:
         cmd_parts = editor.split()
@@ -123,12 +139,15 @@ def open_editor(filepath):
                 break
             except Exception:
                 continue
-                
+
     if not success:
-        print(f"\n[!] Error: Could not launch any terminal-based text editor automatically.")
+        print(
+            f"\n[!] Error: Could not launch any terminal-based text editor automatically."
+        )
         print(f"    Please manually edit/create the configuration file at:")
         print(f"    {filepath}\n")
         input("Press Enter to continue once you have created/edited the file...")
+
 
 def check_config_on_startup():
     config_dir = os.path.dirname(CONFIG_PATH)
@@ -137,18 +156,20 @@ def check_config_on_startup():
             os.makedirs(config_dir, exist_ok=True)
         except Exception as e:
             print(f"Error creating config directory: {e}")
-            
+
     if not os.path.exists(CONFIG_PATH):
         print("\n\033[1;36m▲ WELCOME TO AEROTUNNEL\033[0m")
-        print("\033[1;33mConfiguration file not found. Creating a boilerplate template...\033[0m")
+        print(
+            "\033[1;33mConfiguration file not found. Creating a boilerplate template...\033[0m"
+        )
         create_boilerplate_config(CONFIG_PATH)
         time.sleep(1.5)
-        
+
         while True:
             print(f"\nOpening {CONFIG_PATH} in your text editor...")
             time.sleep(1.0)
             open_editor(CONFIG_PATH)
-            
+
             try:
                 load_json_with_comments(CONFIG_PATH)
                 print("\n\033[1;32m[✓] Configuration parsed successfully!\033[0m")
@@ -156,29 +177,45 @@ def check_config_on_startup():
                 break
             except Exception as e:
                 print(f"\n\033[1;31m[!] Error parsing configuration file:\033[0m {e}")
-                ans = input("Would you like to reopen the editor to fix the error? [Y/n]: ").strip().lower()
-                if ans == 'n':
+                ans = (
+                    input(
+                        "Would you like to reopen the editor to fix the error? [Y/n]: "
+                    )
+                    .strip()
+                    .lower()
+                )
+                if ans == "n":
                     break
+
 
 # --- CONFIGURABLE NOTIFICATION SETTINGS ---
 NOTIFICATION_FAIL_THRESHOLD = 5
 NOTIFICATION_COOLDOWN_SEC = 3600  # 1 hour
 
+
 def send_os_notification(title: str, message: str):
     if "com.termux" in os.environ.get("PREFIX", ""):
         if shutil.which("termux-notification"):
-            subprocess.run(["termux-notification", "-t", title, "-c", message], check=False)
+            subprocess.run(
+                ["termux-notification", "-t", title, "-c", message], check=False
+            )
     else:
         if shutil.which("notify-send"):
             subprocess.run(["notify-send", title, message], check=False)
+
+
 def fmt_time(seconds: float) -> str:
     """Helper to convert raw seconds into a readable Xh Ym Zs format."""
-    if seconds < 0: return "0s"
+    if seconds < 0:
+        return "0s"
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
-    if h > 0: return f"{h}h {m}m {s}s"
-    if m > 0: return f"{m}m {s}s"
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
     return f"{int(seconds)}s"  # <--- Changed this line from {seconds:.1f}s
+
 
 class TunnelStats:
     def __init__(self):
@@ -188,17 +225,17 @@ class TunnelStats:
         self.errors = 0
         self.first_success = "N/A"
         self.status = "Initializing"
-        
+
         # Connection trackers
         self.current_session_start = None
         self.max_duration = 0.0
         self.total_duration = 0.0
-        
+
         # Outage trackers
         self.current_outage_start = time.time()
         self.max_outage = 0.0
         self.total_outage = 0.0
-        
+
         # Notification state
         self.consecutive_errors = 0
         self.last_error_notify_time = 0.0
@@ -211,7 +248,7 @@ class TunnelStats:
             if duration > self.max_duration:
                 self.max_duration = duration
         self.current_session_start = None
-        
+
         # Start the outage timer if it isn't already running
         if not self.current_outage_start:
             self.current_outage_start = time.time()
@@ -225,9 +262,11 @@ class TunnelStats:
         self.current_outage_start = None
         self.current_session_start = time.time()
 
+
 # --- HELP MODAL ---
 class HelpScreen(ModalScreen):
     BINDINGS = [("escape", "app.pop_screen", "Close"), ("h", "app.pop_screen", "Close")]
+
     def compose(self) -> ComposeResult:
         help_text = f"""[bold cyan]▲ LOCAL LLM TUNNEL // HELP & CONTROLS[/bold cyan]
 
@@ -261,11 +300,12 @@ class HelpScreen(ModalScreen):
 [dim]Press ESC or 'h' to close this dialog.[/dim]"""
         yield Container(Static(help_text, markup=True), id="help_panel")
 
+
 # --- BINDING CONFIGURATION MODAL ---
 class BindingModal(ModalScreen[dict]):
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
-        ("space", "toggle", "Toggle 0.0.0.0 / 127.0.0.1")
+        ("space", "toggle", "Toggle 0.0.0.0 / 127.0.0.1"),
     ]
 
     def __init__(self, current_bindings):
@@ -274,9 +314,12 @@ class BindingModal(ModalScreen[dict]):
 
     def compose(self) -> ComposeResult:
         yield Container(
-            Label("[bold cyan]Configure Local Network Bindings[/bold cyan]\n[dim]Up/Down to select • Space to toggle • Enter to apply[/dim]", id="dialog_title"),
+            Label(
+                "[bold cyan]Configure Local Network Bindings[/bold cyan]\n[dim]Up/Down to select • Space to toggle • Enter to apply[/dim]",
+                id="dialog_title",
+            ),
             DataTable(id="binding_table"),
-            id="dialog"
+            id="dialog",
         )
 
     def on_mount(self) -> None:
@@ -284,12 +327,16 @@ class BindingModal(ModalScreen[dict]):
         table.cursor_type = "row"
         table.add_column("Service", key="srv")
         table.add_column("Bind Address", key="ip")
-        
+
         for srv, ip in self.working_bindings.items():
             self._add_or_update_row(table, srv, ip)
 
     def _add_or_update_row(self, table, srv, ip):
-        ip_display = f"[bold white on red] 0.0.0.0 [/]" if ip == "0.0.0.0" else f"[bold green]{ip}[/]"
+        ip_display = (
+            f"[bold white on red] 0.0.0.0 [/]"
+            if ip == "0.0.0.0"
+            else f"[bold green]{ip}[/]"
+        )
         if srv in [row.value for row in table.rows]:
             table.update_cell(srv, "ip", ip_display)
         else:
@@ -302,15 +349,16 @@ class BindingModal(ModalScreen[dict]):
 
     def action_toggle(self) -> None:
         table = self.query_one(DataTable)
-        if table.row_count == 0: return
-        
+        if table.row_count == 0:
+            return
+
         row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
         srv = row_key.value
-        
+
         current_ip = self.working_bindings[srv]
         new_ip = "0.0.0.0" if current_ip == "127.0.0.1" else "127.0.0.1"
         self.working_bindings[srv] = new_ip
-        
+
         self._add_or_update_row(table, srv, new_ip)
 
     def action_apply(self) -> None:
@@ -319,17 +367,24 @@ class BindingModal(ModalScreen[dict]):
     def action_cancel(self) -> None:
         self.dismiss(None)
 
+
 # --- LOGGING MODAL ---
 class LogScreen(ModalScreen):
-    BINDINGS = [("l", "app.pop_screen", "Close Log"), ("escape", "app.pop_screen", "Close")]
-    
+    BINDINGS = [
+        ("l", "app.pop_screen", "Close Log"),
+        ("escape", "app.pop_screen", "Close"),
+    ]
+
     def compose(self) -> ComposeResult:
-        yield Container(RichLog(id="app_log", highlight=True, markup=True), id="log_panel")
+        yield Container(
+            RichLog(id="app_log", highlight=True, markup=True), id="log_panel"
+        )
 
     def on_mount(self) -> None:
         logger = self.query_one(RichLog)
         for msg in getattr(self.app, "log_history", []):
             logger.write(msg)
+
 
 # --- MAIN APP ---
 class TunnelApp(App):
@@ -381,7 +436,7 @@ class TunnelApp(App):
         ("s", "open_shell", "Shell"),
         ("c", "edit_config", "Config"),
         ("r", "retry_connections", "Retry"),
-        ("q", "quit", "Quit")
+        ("q", "quit", "Quit"),
     ]
 
     def __init__(self):
@@ -393,7 +448,7 @@ class TunnelApp(App):
         self.intentional_restart = False
         self.sleep_task = None
         self.log_history = []
-        
+
         self.service_bindings = {}
         self.service_statuses = {}
         self.is_partial_mode = False
@@ -411,15 +466,17 @@ class TunnelApp(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
-        
+
         stats_container = Container(Static(id="stats_text"), id="stats_container")
         stats_container.border_title = "Session Diagnostics"
         yield stats_container
-        
-        srv_container = Container(DataTable(id="services_table"), id="services_container")
+
+        srv_container = Container(
+            DataTable(id="services_table"), id="services_container"
+        )
         srv_container.border_title = "Active Port Mappings"
         yield srv_container
-        
+
         yield Footer()
 
     def on_mount(self) -> None:
@@ -427,7 +484,7 @@ class TunnelApp(App):
         self.install_screen(HelpScreen(), name="help_screen")
         self.title = "▲ AEROTUNNEL COMMAND STATUS"
         self.sub_title = f"v{VERSION} ({DATE_RELEASED})"
-        
+
         self.update_services_table()
         self.set_interval(1.0, self.update_ui)
         self.run_ssh_loop()
@@ -450,12 +507,16 @@ class TunnelApp(App):
         table = self.query_one("#services_table", DataTable)
         table.clear(columns=True)
         table.add_columns("Service", "Local Map", "Target Port", "Status")
-        
+
         if self.config:
             for name, ports in self.config.get("services", {}).items():
                 bind_ip = self.service_bindings.get(name, "127.0.0.1")
-                bind_display = f"[bold white on red] 0.0.0.0 [/]" if bind_ip == "0.0.0.0" else f"[bold green]{bind_ip}[/]"
-                
+                bind_display = (
+                    f"[bold white on red] 0.0.0.0 [/]"
+                    if bind_ip == "0.0.0.0"
+                    else f"[bold green]{bind_ip}[/]"
+                )
+
                 status_val = self.service_statuses.get(name, "pending")
                 if status_val == "active":
                     status_display = "[bold green]✔️ ACTIVE[/]"
@@ -463,12 +524,12 @@ class TunnelApp(App):
                     status_display = "[bold red]❌ PORT IN USE[/]"
                 else:
                     status_display = "[bold yellow]⏳ PENDING[/]"
-                
+
                 table.add_row(
-                    name.upper().replace("_", "-"), 
-                    f"{bind_display}:{ports['local']}", 
-                    str(ports['remote']),
-                    status_display
+                    name.upper().replace("_", "-"),
+                    f"{bind_display}:{ports['local']}",
+                    str(ports["remote"]),
+                    status_display,
                 )
 
     def action_show_help(self) -> None:
@@ -476,44 +537,58 @@ class TunnelApp(App):
 
     def action_toggle_log(self) -> None:
         self.push_screen("log_screen")
-        
+
     def action_open_shell(self) -> None:
         if not self.config:
             self.log_msg("[red]Cannot open shell: No config loaded.[/red]")
             return
 
         with self.suspend():
-            os.system('cls' if os.name == 'nt' else 'clear')
+            os.system("cls" if os.name == "nt" else "clear")
             print("\n\033[1;36m▲ LOCAL LLM TUNNEL // INTERACTIVE SHELL\033[0m")
-            print("\033[1;31m============================================================\033[0m")
-            print("\033[1;33m REMINDER: Press CTRL+D or type 'exit' to return to the TUI \033[0m")
-            print("\033[1;31m============================================================\033[0m\n")
+            print(
+                "\033[1;31m============================================================\033[0m"
+            )
+            print(
+                "\033[1;33m REMINDER: Press CTRL+D or type 'exit' to return to the TUI \033[0m"
+            )
+            print(
+                "\033[1;31m============================================================\033[0m\n"
+            )
             print("Handshaking with remote server...")
-            
-            time.sleep(2.5) 
-            
+
+            time.sleep(2.5)
+
             cmd = [
                 "ssh",
-                "-o", "StrictHostKeyChecking=accept-new",
-                "-p", str(self.config["remote_port"]),
-                f"{self.config['remote_user']}@{self.config['remote_ip']}"
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-p",
+                str(self.config["remote_port"]),
+                f"{self.config['remote_user']}@{self.config['remote_ip']}",
             ]
-            
+
             try:
                 subprocess.run(cmd)
             except Exception as e:
                 print(f"Shell error: {e}")
-                
-            time.sleep(0.5) 
+
+            time.sleep(0.5)
 
     def action_edit_config(self) -> None:
         with self.suspend():
-            os.system('cls' if os.name == 'nt' else 'clear')
+            os.system("cls" if os.name == "nt" else "clear")
             print("\n\033[1;36m▲ LOCAL LLM TUNNEL // EDIT CONFIGURATION\033[0m")
-            print("\033[1;31m============================================================\033[0m")
-            print("\033[1;33m REMINDER: Save and quit your editor to return to the TUI.  \033[0m")
-            print("\033[1;31m============================================================\033[0m\n")
-            
+            print(
+                "\033[1;31m============================================================\033[0m"
+            )
+            print(
+                "\033[1;33m REMINDER: Save and quit your editor to return to the TUI.  \033[0m"
+            )
+            print(
+                "\033[1;31m============================================================\033[0m\n"
+            )
+
             time.sleep(1.0)
             open_editor(CONFIG_PATH)
             time.sleep(0.5)
@@ -522,7 +597,7 @@ class TunnelApp(App):
         if new_config:
             self.config = new_config
             self.is_partial_mode = False
-            
+
             # Re-initialize and update service bindings & statuses
             new_bindings = {}
             new_statuses = {}
@@ -531,12 +606,16 @@ class TunnelApp(App):
                 new_statuses[srv] = "pending"
             self.service_bindings = new_bindings
             self.service_statuses = new_statuses
-            
+
             self.update_services_table()
-            self.log_msg("[yellow]Configuration reloaded. Restarting SSH tunnel...[/yellow]")
+            self.log_msg(
+                "[yellow]Configuration reloaded. Restarting SSH tunnel...[/yellow]"
+            )
             self.restart_tunnel()
         else:
-            self.log_msg("[bold red]Failed to reload config: invalid JSON or missing file.[/bold red]")
+            self.log_msg(
+                "[bold red]Failed to reload config: invalid JSON or missing file.[/bold red]"
+            )
 
     @work
     async def action_configure_bindings(self) -> None:
@@ -544,7 +623,9 @@ class TunnelApp(App):
         if new_bindings:
             self.service_bindings = new_bindings
             self.update_services_table()
-            self.log_msg("[yellow]Network bindings updated. Restarting SSH tunnel...[/yellow]")
+            self.log_msg(
+                "[yellow]Network bindings updated. Restarting SSH tunnel...[/yellow]"
+            )
             self.restart_tunnel()
 
     def restart_tunnel(self):
@@ -559,24 +640,26 @@ class TunnelApp(App):
             self.sleep_task.cancel()
 
     def action_retry_connections(self) -> None:
-        self.log_msg("[yellow]User requested connection retry. Resetting and dropping active links...[/yellow]")
-        
+        self.log_msg(
+            "[yellow]User requested connection retry. Resetting and dropping active links...[/yellow]"
+        )
+
         # Reset all service statuses to pending
         if self.config:
             for srv in self.config.get("services", {}).keys():
                 self.service_statuses[srv] = "pending"
         self.update_services_table()
-        
+
         self.restart_tunnel()
 
     def log_msg(self, msg: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
         formatted_msg = f"[dim]{timestamp}[/dim] {msg}"
-        
+
         self.log_history.append(formatted_msg)
         if len(self.log_history) > 500:
             self.log_history.pop(0)
-            
+
         try:
             if self.is_screen_installed("log_screen"):
                 log_screen = self.get_screen("log_screen")
@@ -587,16 +670,20 @@ class TunnelApp(App):
 
     def update_ui(self):
         is_connected = self.stats.current_session_start is not None
-        
+
         # Calculate real-time active timers
         app_runtime = max(0, time.time() - self.stats.app_start_time)
-        active_session = time.time() - self.stats.current_session_start if is_connected else 0.0
-        active_outage = time.time() - self.stats.current_outage_start if not is_connected else 0.0
-        
+        active_session = (
+            time.time() - self.stats.current_session_start if is_connected else 0.0
+        )
+        active_outage = (
+            time.time() - self.stats.current_outage_start if not is_connected else 0.0
+        )
+
         # Calculate cumulative totals
         total_up = self.stats.total_duration + active_session
         total_down = self.stats.total_outage + active_outage
-        
+
         # Derived SLAs
         uptime_pct = (total_up / app_runtime * 100) if app_runtime > 0 else 0.0
         mtbf = total_up / max(1, self.stats.errors)
@@ -609,20 +696,39 @@ class TunnelApp(App):
         table.add_column(style="white")
         table.add_column(style="bold magenta", justify="right")
         table.add_column(style="white")
-        
+
         remote_host = "N/A"
         remote_port = "N/A"
         if self.config:
             remote_host = f"[bold cyan]{self.config.get('remote_user', '')}@{self.config.get('remote_ip', '')}[/]"
             remote_port = f"[bold cyan]{self.config.get('remote_port', '')}[/]"
-            
+
         table.add_row("Remote Host:", remote_host, "SSH Port:", remote_port)
-        table.add_row("Engine Runtime:", fmt_time(app_runtime), "Uptime Ratio:", f"{uptime_pct:.5f}%")
-        table.add_row("Total Uptime:", fmt_time(total_up), "Total Downtime:", fmt_time(total_down))
-        table.add_row("Current Link:", fmt_time(active_session), "Longest Link:", fmt_time(max(self.stats.max_duration, active_session)))
-        table.add_row("Current Outage:", fmt_time(active_outage), "Longest Outage:", fmt_time(max_outage_display))
-        table.add_row("MTBF (Avg Up):", fmt_time(mtbf), "MTTR (Avg Down):", fmt_time(mttr))
-        
+        table.add_row(
+            "Engine Runtime:",
+            fmt_time(app_runtime),
+            "Uptime Ratio:",
+            f"{uptime_pct:.5f}%",
+        )
+        table.add_row(
+            "Total Uptime:", fmt_time(total_up), "Total Downtime:", fmt_time(total_down)
+        )
+        table.add_row(
+            "Current Link:",
+            fmt_time(active_session),
+            "Longest Link:",
+            fmt_time(max(self.stats.max_duration, active_session)),
+        )
+        table.add_row(
+            "Current Outage:",
+            fmt_time(active_outage),
+            "Longest Outage:",
+            fmt_time(max_outage_display),
+        )
+        table.add_row(
+            "MTBF (Avg Up):", fmt_time(mtbf), "MTTR (Avg Down):", fmt_time(mttr)
+        )
+
         if is_connected:
             if self.is_partial_mode or self.stats.status in ["DEGRADED", "PARTIAL"]:
                 status_ui = f"[bold yellow]{self.stats.status}[/]"
@@ -630,8 +736,13 @@ class TunnelApp(App):
                 status_ui = "[bold green]CONNECTED[/]"
         else:
             status_ui = f"[bold red]{self.stats.status}[/]"
-            
-        table.add_row("Attempts/Drops:", f"{self.stats.attempts} / {self.stats.errors}", "Status:", status_ui)
+
+        table.add_row(
+            "Attempts/Drops:",
+            f"{self.stats.attempts} / {self.stats.errors}",
+            "Status:",
+            status_ui,
+        )
 
         self.query_one("#stats_text", Static).update(table)
 
@@ -639,13 +750,16 @@ class TunnelApp(App):
         self.stats.record_disconnect()
         self.stats.consecutive_errors += 1
         self.stats.errors += 1
-        
+
         if self.stats.consecutive_errors >= NOTIFICATION_FAIL_THRESHOLD:
             now = time.time()
-            if not self.stats.in_error_state or (now - self.stats.last_error_notify_time) > NOTIFICATION_COOLDOWN_SEC:
+            if (
+                not self.stats.in_error_state
+                or (now - self.stats.last_error_notify_time) > NOTIFICATION_COOLDOWN_SEC
+            ):
                 send_os_notification(
-                    "LLM Tunnel Down", 
-                    f"Connection failed {self.stats.consecutive_errors} times in a row."
+                    "LLM Tunnel Down",
+                    f"Connection failed {self.stats.consecutive_errors} times in a row.",
                 )
                 self.stats.last_error_notify_time = now
                 self.stats.in_error_state = True
@@ -654,11 +768,10 @@ class TunnelApp(App):
         self.stats.record_connect()
         if self.stats.in_error_state:
             send_os_notification(
-                "LLM Tunnel Restored", 
-                "Connection to remote LLM server re-established."
+                "LLM Tunnel Restored", "Connection to remote LLM server re-established."
             )
             self.stats.in_error_state = False
-            
+
         self.stats.consecutive_errors = 0
         self.stats.success_count += 1
         if self.stats.first_success == "N/A":
@@ -670,12 +783,14 @@ class TunnelApp(App):
             self.log_msg(f"[red]Error: Could not load config at {CONFIG_PATH}[/red]")
             return
 
-        self.log_msg("[bold cyan]System Initialized. Starting routing loop...[/bold cyan]")
+        self.log_msg(
+            "[bold cyan]System Initialized. Starting routing loop...[/bold cyan]"
+        )
 
         try:
             while self.running:
                 self.intentional_restart = False
-                
+
                 # If not in partial mode, this is a fresh attempt to bind all configured services
                 if not self.is_partial_mode:
                     self.stats.status = "Routing..."
@@ -683,38 +798,51 @@ class TunnelApp(App):
                         self.service_statuses[srv] = "pending"
                     self.active_services_to_bind = list(self.config["services"].keys())
                     self.update_services_table()
-                
+
                 self.stats.attempts += 1
-                
+
                 cmd = [
-                    "ssh", "-N",
-                    "-o", "ServerAliveInterval=10",
-                    "-o", "ServerAliveCountMax=2", 
-                    "-o", "ConnectTimeout=5",
-                    "-o", "StrictHostKeyChecking=accept-new",
-                    "-p", str(self.config["remote_port"])
+                    "ssh",
+                    "-N",
+                    "-o",
+                    "ServerAliveInterval=10",
+                    "-o",
+                    "ServerAliveCountMax=2",
+                    "-o",
+                    "ConnectTimeout=5",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-p",
+                    str(self.config["remote_port"]),
                 ]
-                
+
                 for srv_name in self.active_services_to_bind:
                     ports = self.config["services"][srv_name]
                     bind_ip = self.service_bindings.get(srv_name, "127.0.0.1")
-                    cmd.extend(["-L", f"{bind_ip}:{ports['local']}:127.0.0.1:{ports['remote']}"])
-                    
+                    cmd.extend(
+                        [
+                            "-L",
+                            f"{bind_ip}:{ports['local']}:127.0.0.1:{ports['remote']}",
+                        ]
+                    )
+
                 cmd.append(f"{self.config['remote_user']}@{self.config['remote_ip']}")
                 self.log_msg(f"[yellow]Spawning Subprocess:[/yellow] {' '.join(cmd)}")
-                
+
                 try:
                     self.ssh_process = await asyncio.create_subprocess_exec(
                         *cmd,
                         stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
+                        stderr=asyncio.subprocess.PIPE,
                     )
-                    
+
                     stderr_lines = []
+
                     async def read_stream(stream, is_stderr=False):
                         while True:
                             line = await stream.readline()
-                            if not line: break
+                            if not line:
+                                break
                             line_str = line.decode().strip()
                             if is_stderr:
                                 stderr_lines.append(line_str)
@@ -723,15 +851,15 @@ class TunnelApp(App):
 
                     asyncio.create_task(read_stream(self.ssh_process.stdout))
                     asyncio.create_task(read_stream(self.ssh_process.stderr, True))
-                    
+
                     # We give SSH exactly 6 seconds to prove it's stable.
                     try:
                         await asyncio.wait_for(self.ssh_process.wait(), timeout=6.0)
-                        
+
                         # If it exits before 6 seconds, the connection failed early.
                         err_msg = "Connection rejected or unreachable"
                         status_str = "Host Unreachable"
-                        
+
                         stderr_content = "\n".join(stderr_lines).lower()
                         if "permission denied" in stderr_content:
                             status_str = "Auth Failure"
@@ -739,92 +867,128 @@ class TunnelApp(App):
                         elif "connection refused" in stderr_content:
                             status_str = "Conn Refused"
                             err_msg = "Connection refused by remote host"
-                        elif "no route to host" in stderr_content or "destination host unreachable" in stderr_content or "network is unreachable" in stderr_content:
+                        elif (
+                            "no route to host" in stderr_content
+                            or "destination host unreachable" in stderr_content
+                            or "network is unreachable" in stderr_content
+                        ):
                             status_str = "Host Unreachable"
                             err_msg = "Host unreachable / No route to host"
                         elif "timed out" in stderr_content:
                             status_str = "Timed Out"
                             err_msg = "Connection timed out"
-                        elif "could not resolve hostname" in stderr_content or "name or service not known" in stderr_content:
+                        elif (
+                            "could not resolve hostname" in stderr_content
+                            or "name or service not known" in stderr_content
+                        ):
                             status_str = "DNS Failure"
                             err_msg = "Could not resolve remote hostname"
-                        elif "address already in use" in stderr_content or "cannot listen to port" in stderr_content:
+                        elif (
+                            "address already in use" in stderr_content
+                            or "cannot listen to port" in stderr_content
+                        ):
                             status_str = "All Ports In Use"
                             err_msg = "All requested local ports are already in use"
-                            
-                        self.log_msg(f"[bold red]{err_msg} (Code: {self.ssh_process.returncode})[/bold red]")
-                        
+
+                        self.log_msg(
+                            f"[bold red]{err_msg} (Code: {self.ssh_process.returncode})[/bold red]"
+                        )
+
                         # Mark all requested services as blocked if we got All Ports In Use
-                        if status_str == "All Ports In Use" or "address already in use" in stderr_content:
+                        if (
+                            status_str == "All Ports In Use"
+                            or "address already in use" in stderr_content
+                        ):
                             for srv in self.active_services_to_bind:
                                 self.service_statuses[srv] = "failed_port_in_use"
                             self.update_services_table()
-                            
+
                         self.stats.status = status_str
                         self.handle_connection_failure()
-                        
+
                     except asyncio.TimeoutError:
                         # Connection survived the 6-second timeout.
                         # Parse stderr to see if any requested ports failed to bind.
                         local_ports_to_service = {
-                            ports["local"]: srv for srv, ports in self.config["services"].items()
+                            ports["local"]: srv
+                            for srv, ports in self.config["services"].items()
                             if srv in self.active_services_to_bind
                         }
                         failed_ports = set()
-                        
+
                         import re
+
                         for line in stderr_lines:
-                            if "address already in use" in line.lower() or "cannot listen to port" in line.lower():
+                            if (
+                                "address already in use" in line.lower()
+                                or "cannot listen to port" in line.lower()
+                            ):
                                 digits = re.findall(r"\b\d{2,5}\b", line)
                                 for d in digits:
                                     p = int(d)
                                     if p in local_ports_to_service:
                                         failed_ports.add(p)
-                                        
+
                         # If some ports were already in use
                         if failed_ports and not self.is_partial_mode:
                             failed_services = []
                             successful_services = []
-                            
+
                             for srv_name in self.active_services_to_bind:
                                 p = self.config["services"][srv_name]["local"]
                                 if p in failed_ports:
-                                    self.service_statuses[srv_name] = "failed_port_in_use"
+                                    self.service_statuses[srv_name] = (
+                                        "failed_port_in_use"
+                                    )
                                     failed_services.append(srv_name)
                                 else:
                                     self.service_statuses[srv_name] = "active"
                                     successful_services.append(srv_name)
-                                    
+
                             self.update_services_table()
-                            
+
                             # Terminate the first SSH command so we can redo it with only working ports
                             if self.ssh_process:
                                 try:
                                     self.ssh_process.terminate()
                                 except Exception:
                                     pass
-                                    
+
                             if not successful_services:
                                 # All ports were blocked
-                                self.log_msg("[bold red]All requested local ports are already in use.[/bold red]")
+                                self.log_msg(
+                                    "[bold red]All requested local ports are already in use.[/bold red]"
+                                )
                                 self.stats.status = "All Ports In Use"
                                 self.handle_connection_failure()
                             else:
                                 # Succeeded for some, failed for others!
-                                self.log_msg(f"[bold yellow]Partial connection established. Active: {successful_services}. Blocked: {failed_services}[/bold yellow]")
-                                
+                                self.log_msg(
+                                    f"[bold yellow]Partial connection established. Active: {successful_services}. Blocked: {failed_services}[/bold yellow]"
+                                )
+
                                 # Log the warning lines verbatim
                                 for line in stderr_lines:
-                                    if "address already in use" in line.lower() or "cannot listen to port" in line.lower():
-                                        self.log_msg(f"[bold red][PORT WARNING] {line}[/bold red]")
-                                        
+                                    if (
+                                        "address already in use" in line.lower()
+                                        or "cannot listen to port" in line.lower()
+                                    ):
+                                        self.log_msg(
+                                            f"[bold red][PORT WARNING] {line}[/bold red]"
+                                        )
+
                                 # Send desktop notification
-                                notify_details = ", ".join([f"{srv} ({self.config['services'][srv]['local']})" for srv in failed_services])
+                                notify_details = ", ".join(
+                                    [
+                                        f"{srv} ({self.config['services'][srv]['local']})"
+                                        for srv in failed_services
+                                    ]
+                                )
                                 send_os_notification(
                                     "LLM Tunnel Degraded",
-                                    f"Connected partially. Ports already in use: {notify_details}"
+                                    f"Connected partially. Ports already in use: {notify_details}",
                                 )
-                                
+
                                 # Switch to partial mode and continue to restart the connection with only successful ports
                                 self.is_partial_mode = True
                                 self.active_services_to_bind = successful_services
@@ -835,40 +999,53 @@ class TunnelApp(App):
                             for srv_name in self.active_services_to_bind:
                                 self.service_statuses[srv_name] = "active"
                             self.update_services_table()
-                            
+
                             if self.is_partial_mode:
                                 self.stats.status = "DEGRADED"
-                                self.log_msg("[bold yellow]Degraded Link Established. Working ports are hot.[/bold yellow]")
+                                self.log_msg(
+                                    "[bold yellow]Degraded Link Established. Working ports are hot.[/bold yellow]"
+                                )
                             else:
                                 self.stats.status = "CONNECTED"
-                                self.log_msg("[bold green]Link Established. Ports are hot.[/bold green]")
-                                
+                                self.log_msg(
+                                    "[bold green]Link Established. Ports are hot.[/bold green]"
+                                )
+
                             self.handle_connection_success()
-                            
+
                             # Wait indefinitely for the session to organically drop
                             await self.ssh_process.wait()
-                            
+
                             if self.intentional_restart:
-                                self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
+                                self.log_msg(
+                                    "[dim]Process terminated for reconfiguration.[/dim]"
+                                )
                                 self.stats.record_disconnect()
                                 continue
-                                
-                            self.log_msg(f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]")
+
+                            self.log_msg(
+                                f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]"
+                            )
                             self.handle_connection_failure()
                             self.is_partial_mode = False  # Reset on drop
-                            
+
                 except Exception as e:
                     self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
                     self.handle_connection_failure()
                     self.is_partial_mode = False
-                    
+
                 if self.is_partial_mode:
                     self.stats.status = "DEGRADED"
-                elif not self.stats.status or self.stats.status in ["CONNECTED", "Routing..."]:
+                elif not self.stats.status or self.stats.status in [
+                    "CONNECTED",
+                    "Routing...",
+                ]:
                     self.stats.status = "Host Unreachable"
-                    
-                self.log_msg("[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]")
-                
+
+                self.log_msg(
+                    "[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]"
+                )
+
                 try:
                     self.sleep_task = asyncio.create_task(asyncio.sleep(5))
                     await self.sleep_task
@@ -882,14 +1059,19 @@ class TunnelApp(App):
                 except Exception:
                     pass
 
-if __name__ == "__main__":
+
+def main():
     check_config_on_startup()
     app = TunnelApp()
     try:
         app.run()
     finally:
-        if hasattr(app, 'ssh_process') and app.ssh_process:
+        if hasattr(app, "ssh_process") and app.ssh_process:
             try:
                 app.ssh_process.terminate()
             except Exception:
                 pass
+
+
+if __name__ == "__main__":
+    main()
