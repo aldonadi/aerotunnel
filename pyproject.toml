@@ -1,7 +1,7 @@
 [project]
 name = "aerotunnel"
-version = "0.2.2"
-description = "TUI dashboard for monitoring and managing SSH tunnels for local LLM services"
+version = "0.2.3"
+description = "TUI dashboard for monitoring and managing forward/reverse SSH tunnels for tunneled services"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
