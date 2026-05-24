@@ -64,45 +64,29 @@ def create_boilerplate_config(filepath):
 // Comments (single-line // or #, block /* */) are fully supported!
 // ============================================================================
 {
-  // The hostname or IP address of your remote server (e.g., "ssh.someserver.com" or "192.168.1.100")
-  "remote_host": "127.0.0.1",
-
-  // The SSH port of your remote server (default is 22)
-  "remote_port": 22,
+  // The IP address or domain name of your remote server (e.g., "192.168.1.100" or "ssh.myllm.server")
+  "remote_ip": "127.0.0.1",
 
   // The SSH username for logging into your remote server
   "remote_user": "change_me",
 
+  // The SSH port of your remote server (default is 22)
+  "remote_port": 22,
+
   // Services to forward through the secure SSH tunnel.
-  // Each service supports:
-  //   - "type": "local" (default) or "remote" (reverse tunnel)
-  //   - "local_port": local listen port (required for local type)
-  //   - "remote_port": remote listen port (required for remote type)
-  //   - "service_port": target port (always required)
-  //   - "service_host": target destination host (defaults to "127.0.0.1" / localhost)
-  //   - "bind_address": listening bind address override (defaults to "127.0.0.1")
+  // Each service has:
+  //   - "local": the port opened on your local machine to access the service
+  //   - "remote": the port on the remote machine where the service is running
   "services": {
-    // 1. Minimally configured listener (-L) service forwarding.
-    // Listens on local 127.0.0.1:11434, forwards to remote 127.0.0.1:11434
+    // Ollama AI Service (Default: local 11434 -> remote 11434)
     "ollama": {
-      "local_port": 11434,
-      "service_port": 11434
+      "local": 11434,
+      "remote": 11434
     },
-    // 2. Minimally configured reverse-forwarded (-R) service forwarding.
-    // Listens on remote 127.0.0.1:9000, forwards to local 127.0.0.1:9000
-    "reverse_test": {
-      "type": "remote",
-      "remote_port": 9000,
-      "service_port": 9000
-    },
-    // 3. Maximally configured example (specifying all fields)
-    // Opens a port on local 0.0.0.0:8080, tunnels through SSH to web.internal.someserver.com:80
-    "max_example": {
-      "type": "local",
-      "local_port": 8080,
-      "bind_address": "0.0.0.0",
-      "service_host": "web.internal.someserver.com",
-      "service_port": 80
+    // Open WebUI / Gradio interface (Default: local 3000 -> remote 8080)
+    "webui": {
+      "local": 3000,
+      "remote": 8080
     }
   }
 }
@@ -467,12 +451,11 @@ class TunnelApp(App):
 
         self.service_bindings = {}
         self.service_statuses = {}
-        self.expanded_services = set()
         self.is_partial_mode = False
         self.active_services_to_bind = []
         if self.config:
-            for srv, srv_conf in self.config.get("services", {}).items():
-                self.service_bindings[srv] = srv_conf.get("bind_address", "127.0.0.1")
+            for srv in self.config.get("services", {}).keys():
+                self.service_bindings[srv] = "127.0.0.1"
                 self.service_statuses[srv] = "pending"
 
     def load_config(self):
@@ -502,9 +485,6 @@ class TunnelApp(App):
         self.title = "▲ AEROTUNNEL COMMAND STATUS"
         self.sub_title = f"v{VERSION} ({DATE_RELEASED})"
 
-        table = self.query_one("#services_table", DataTable)
-        table.cursor_type = "row"
-
         self.update_services_table()
         self.set_interval(1.0, self.update_ui)
         self.run_ssh_loop()
@@ -522,44 +502,21 @@ class TunnelApp(App):
             self.screen.add_class("mobile_layout")
         else:
             self.screen.remove_class("mobile_layout")
-        self.update_services_table()
 
     def update_services_table(self):
         table = self.query_one("#services_table", DataTable)
-        
-        # Remember current cursor coordinate to restore focus/scroll position!
-        try:
-            old_coordinate = table.cursor_coordinate
-            old_row_key = table.coordinate_to_cell_key(old_coordinate).row_key.value
-        except Exception:
-            old_row_key = None
-
         table.clear(columns=True)
-        
-        is_mobile = self.screen.has_class("mobile_layout")
-        if is_mobile:
-            table.add_columns("Service", "Tunnel Map", "Status")
-        else:
-            table.add_columns("Service", "Listen (Source)", "Flow", "Target (Destination)", "Status")
+        table.add_columns("Service", "Local Map", "Target Port", "Status")
 
         if self.config:
-            for name, srv_conf in self.config.get("services", {}).items():
-                srv_type = srv_conf.get("type", "local")
-                service_host = srv_conf.get("service_host", "127.0.0.1")
-                service_port = srv_conf["service_port"]
-                
-                if srv_type == "remote":
-                    listen_port = srv_conf["remote_port"]
-                else:
-                    listen_port = srv_conf["local_port"]
-                
-                bind_ip = self.service_bindings.get(name, srv_conf.get("bind_address", "127.0.0.1"))
+            for name, ports in self.config.get("services", {}).items():
+                bind_ip = self.service_bindings.get(name, "127.0.0.1")
                 bind_display = (
                     f"[bold white on red] 0.0.0.0 [/]"
                     if bind_ip == "0.0.0.0"
                     else f"[bold green]{bind_ip}[/]"
                 )
-                
+
                 status_val = self.service_statuses.get(name, "pending")
                 if status_val == "active":
                     status_display = "[bold green]✔️ ACTIVE[/]"
@@ -568,128 +525,12 @@ class TunnelApp(App):
                 else:
                     status_display = "[bold yellow]⏳ PENDING[/]"
 
-                if is_mobile:
-                    if srv_type == "remote":
-                        map_str = f"[bold cyan][R][/] {bind_display}:{listen_port} [yellow]↢[/] {listen_port}"
-                    else:
-                        map_str = f"[bold cyan][L][/] {bind_display}:{listen_port} [yellow]↣[/] {service_port}"
-                    
-                    table.add_row(
-                        name.upper().replace("_", "-"),
-                        map_str,
-                        status_display,
-                        key=name
-                    )
-                    
-                    if name in self.expanded_services:
-                        type_str = "Remote Forwarding (-R)" if srv_type == "remote" else "Local Forwarding (-L)"
-                        table.add_row(
-                            "  [dim]↳ Type:[/dim]",
-                            f"[cyan]{type_str}[/]",
-                            "",
-                            key=f"{name}_sub_type"
-                        )
-                        table.add_row(
-                            "  [dim]↳ Listen:[/dim]",
-                            f"[green]{bind_ip}:{listen_port}[/]",
-                            "",
-                            key=f"{name}_sub_listen"
-                        )
-                        table.add_row(
-                            "  [dim]↳ Target:[/dim]",
-                            f"[white]{service_host}:{service_port}[/]",
-                            "",
-                            key=f"{name}_sub_dest"
-                        )
-                else:
-                    flow_str = "[yellow]↢ [R] ↢[/]" if srv_type == "remote" else "[yellow]↣ [L] ↣[/]"
-                    
-                    table.add_row(
-                        name.upper().replace("_", "-"),
-                        f"{bind_display}:{listen_port}",
-                        flow_str,
-                        f"{service_host}:{service_port}",
-                        status_display,
-                        key=name
-                    )
-                    
-                    if name in self.expanded_services:
-                        type_str = "Remote Forwarding (-R)" if srv_type == "remote" else "Local Forwarding (-L)"
-                        table.add_row(
-                            "  [dim]↳ Type:[/dim]",
-                            f"[cyan]{type_str}[/]",
-                            "",
-                            "",
-                            "",
-                            key=f"{name}_sub_type"
-                        )
-                        table.add_row(
-                            "  [dim]↳ Listen:[/dim]",
-                            f"[green]{bind_ip}:{listen_port}[/]",
-                            "",
-                            "",
-                            "",
-                            key=f"{name}_sub_listen"
-                        )
-                        table.add_row(
-                            "  [dim]↳ Target:[/dim]",
-                            f"[white]{service_host}:{service_port}[/]",
-                            "",
-                            "",
-                            "",
-                            key=f"{name}_sub_dest"
-                        )
-                        
-        if old_row_key is not None:
-            try:
-                for idx, rk in enumerate(table.rows.keys()):
-                    if rk.value == old_row_key:
-                        table.cursor_coordinate = (idx, 0)
-                        break
-            except Exception:
-                pass
-
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        row_key = event.row_key.value
-        parent_service = None
-        if row_key in self.config.get("services", {}):
-            parent_service = row_key
-        else:
-            for srv in self.config.get("services", {}):
-                if row_key.startswith(f"{srv}_sub_"):
-                    parent_service = srv
-                    break
-        if parent_service:
-            if parent_service in self.expanded_services:
-                self.expanded_services.remove(parent_service)
-            else:
-                self.expanded_services.add(parent_service)
-            self.update_services_table()
-
-    def on_key(self, event: events.Key) -> None:
-        if event.key == "space":
-            table = self.query_one("#services_table", DataTable)
-            if table.has_focus:
-                try:
-                    coordinate = table.cursor_coordinate
-                    row_key = table.coordinate_to_cell_key(coordinate).row_key.value
-                    parent_service = None
-                    if row_key in self.config.get("services", {}):
-                        parent_service = row_key
-                    else:
-                        for srv in self.config.get("services", {}):
-                            if row_key.startswith(f"{srv}_sub_"):
-                                parent_service = srv
-                                break
-                    if parent_service:
-                        if parent_service in self.expanded_services:
-                            self.expanded_services.remove(parent_service)
-                        else:
-                            self.expanded_services.add(parent_service)
-                        self.update_services_table()
-                        event.prevent_default()
-                except Exception:
-                    pass
+                table.add_row(
+                    name.upper().replace("_", "-"),
+                    f"{bind_display}:{ports['local']}",
+                    str(ports["remote"]),
+                    status_display,
+                )
 
     def action_show_help(self) -> None:
         self.push_screen("help_screen")
@@ -724,7 +565,7 @@ class TunnelApp(App):
                 "StrictHostKeyChecking=accept-new",
                 "-p",
                 str(self.config["remote_port"]),
-                f"{self.config['remote_user']}@{self.config['remote_host']}",
+                f"{self.config['remote_user']}@{self.config['remote_ip']}",
             ]
 
             try:
@@ -760,12 +601,11 @@ class TunnelApp(App):
             # Re-initialize and update service bindings & statuses
             new_bindings = {}
             new_statuses = {}
-            for srv, srv_conf in self.config.get("services", {}).items():
-                new_bindings[srv] = self.service_bindings.get(srv, srv_conf.get("bind_address", "127.0.0.1"))
+            for srv in self.config.get("services", {}).keys():
+                new_bindings[srv] = self.service_bindings.get(srv, "127.0.0.1")
                 new_statuses[srv] = "pending"
             self.service_bindings = new_bindings
             self.service_statuses = new_statuses
-            self.expanded_services = {s for s in self.expanded_services if s in self.config.get("services", {})}
 
             self.update_services_table()
             self.log_msg(
@@ -860,7 +700,7 @@ class TunnelApp(App):
         remote_host = "N/A"
         remote_port = "N/A"
         if self.config:
-            remote_host = f"[bold cyan]{self.config.get('remote_user', '')}@{self.config.get('remote_host', '')}[/]"
+            remote_host = f"[bold cyan]{self.config.get('remote_user', '')}@{self.config.get('remote_ip', '')}[/]"
             remote_port = f"[bold cyan]{self.config.get('remote_port', '')}[/]"
 
         table.add_row("Remote Host:", remote_host, "SSH Port:", remote_port)
@@ -977,30 +817,16 @@ class TunnelApp(App):
                 ]
 
                 for srv_name in self.active_services_to_bind:
-                    srv_conf = self.config["services"][srv_name]
-                    srv_type = srv_conf.get("type", "local")
-                    service_host = srv_conf.get("service_host", "127.0.0.1")
-                    service_port = srv_conf["service_port"]
-                    bind_ip = self.service_bindings.get(srv_name, srv_conf.get("bind_address", "127.0.0.1"))
-                    
-                    if srv_type == "remote":
-                        remote_port = srv_conf["remote_port"]
-                        cmd.extend(
-                            [
-                                "-R",
-                                f"{bind_ip}:{remote_port}:{service_host}:{service_port}",
-                            ]
-                        )
-                    else:
-                        local_port = srv_conf["local_port"]
-                        cmd.extend(
-                            [
-                                "-L",
-                                f"{bind_ip}:{local_port}:{service_host}:{service_port}",
-                            ]
-                        )
+                    ports = self.config["services"][srv_name]
+                    bind_ip = self.service_bindings.get(srv_name, "127.0.0.1")
+                    cmd.extend(
+                        [
+                            "-L",
+                            f"{bind_ip}:{ports['local']}:127.0.0.1:{ports['remote']}",
+                        ]
+                    )
 
-                cmd.append(f"{self.config['remote_user']}@{self.config['remote_host']}")
+                cmd.append(f"{self.config['remote_user']}@{self.config['remote_ip']}")
                 self.log_msg(f"[yellow]Spawning Subprocess:[/yellow] {' '.join(cmd)}")
 
                 try:
@@ -1062,7 +888,7 @@ class TunnelApp(App):
                             or "cannot listen to port" in stderr_content
                         ):
                             status_str = "All Ports In Use"
-                            err_msg = "All requested ports are already in use"
+                            err_msg = "All requested local ports are already in use"
 
                         self.log_msg(
                             f"[bold red]{err_msg} (Code: {self.ssh_process.returncode})[/bold red]"
@@ -1083,17 +909,13 @@ class TunnelApp(App):
                     except asyncio.TimeoutError:
                         # Connection survived the 6-second timeout.
                         # Parse stderr to see if any requested ports failed to bind.
-                        listen_port_to_service = {}
-                        for srv in self.active_services_to_bind:
-                            srv_conf = self.config["services"][srv]
-                            srv_type = srv_conf.get("type", "local")
-                            if srv_type == "remote":
-                                listen_port = srv_conf["remote_port"]
-                            else:
-                                listen_port = srv_conf["local_port"]
-                            listen_port_to_service[listen_port] = srv
-
+                        local_ports_to_service = {
+                            ports["local"]: srv
+                            for srv, ports in self.config["services"].items()
+                            if srv in self.active_services_to_bind
+                        }
                         failed_ports = set()
+
                         import re
 
                         for line in stderr_lines:
@@ -1104,7 +926,7 @@ class TunnelApp(App):
                                 digits = re.findall(r"\b\d{2,5}\b", line)
                                 for d in digits:
                                     p = int(d)
-                                    if p in listen_port_to_service:
+                                    if p in local_ports_to_service:
                                         failed_ports.add(p)
 
                         # If some ports were already in use
@@ -1113,9 +935,7 @@ class TunnelApp(App):
                             successful_services = []
 
                             for srv_name in self.active_services_to_bind:
-                                srv_conf = self.config["services"][srv_name]
-                                srv_type = srv_conf.get("type", "local")
-                                p = srv_conf["remote_port"] if srv_type == "remote" else srv_conf["local_port"]
+                                p = self.config["services"][srv_name]["local"]
                                 if p in failed_ports:
                                     self.service_statuses[srv_name] = (
                                         "failed_port_in_use"
@@ -1137,7 +957,7 @@ class TunnelApp(App):
                             if not successful_services:
                                 # All ports were blocked
                                 self.log_msg(
-                                    "[bold red]All requested ports are already in use.[/bold red]"
+                                    "[bold red]All requested local ports are already in use.[/bold red]"
                                 )
                                 self.stats.status = "All Ports In Use"
                                 self.handle_connection_failure()
@@ -1160,7 +980,7 @@ class TunnelApp(App):
                                 # Send desktop notification
                                 notify_details = ", ".join(
                                     [
-                                        f"{srv} ({self.config['services'][srv]['remote_port'] if self.config['services'][srv].get('type') == 'remote' else self.config['services'][srv]['local_port']})"
+                                        f"{srv} ({self.config['services'][srv]['local']})"
                                         for srv in failed_services
                                     ]
                                 )
