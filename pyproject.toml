@@ -1,6 +1,6 @@
 [project]
 name = "aerotunnel"
-version = "0.2.3"
+version = "0.2.4"
 description = "TUI dashboard for monitoring and managing forward/reverse SSH tunnels for tunneled services"
 readme = "README.md"
 requires-python = ">=3.9"
