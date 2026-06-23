@@ -20,9 +20,14 @@ CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
 # Version Information
 MAJOR = 0
 MINOR = 2
-PATCH = 3
+PATCH = 4
 VERSION = f"{MAJOR}.{MINOR}.{PATCH}"
-DATE_RELEASED = "2026-05-24"
+DATE_RELEASED = "2026-06-23"
+
+
+class ConfigValidationError(Exception):
+    """Custom exception for configuration parsing and validation errors."""
+    pass
 
 
 def load_json_with_comments(filepath):
@@ -53,7 +58,86 @@ def load_json_with_comments(filepath):
 
     clean_content = re.sub(pattern_hash, replacer_hash, clean_content)
 
-    return json.loads(clean_content)
+    try:
+        return json.loads(clean_content)
+    except json.JSONDecodeError as e:
+        # Provide exact context for the syntax failure
+        lines = clean_content.splitlines()
+        error_line = lines[e.lineno - 1].strip() if e.lineno <= len(lines) else "Unknown"
+        raise ConfigValidationError(
+            f"Invalid JSON syntax\n"
+            f"  Reason: {e.msg}\n"
+            f"  Location: Line {e.lineno}, Column {e.colno}\n"
+            f"  Snippet: '{error_line}'\n"
+            f"  (Common issues: missing commas, trailing commas, or unquoted strings)"
+        )
+
+
+def validate_config(data, logger_cb=print):
+    """Validates the structure of the config dictionary and logs parsed parameters."""
+    if not isinstance(data, dict):
+        raise ConfigValidationError("The root of the configuration file must be a JSON object (dictionary).")
+
+    required_root_keys = {
+        "remote_host": str,
+        "remote_port": int,
+        "remote_user": str,
+        "services": dict
+    }
+
+    for key, expected_type in required_root_keys.items():
+        if key not in data:
+            raise ConfigValidationError(f"Missing required root-level key: '{key}'")
+        if not isinstance(data[key], expected_type):
+            type_name = expected_type.__name__
+            raise ConfigValidationError(f"The '{key}' setting must be of type {type_name}. Found: {type(data[key]).__name__}")
+        
+        if key != "services":
+            logger_cb(f"[Parsed] {key}: {data[key]}")
+
+    logger_cb(f"[Parsed] Found {len(data['services'])} service(s) to map in 'services' block.")
+
+    for srv_name, srv_conf in data["services"].items():
+        if not isinstance(srv_conf, dict):
+            raise ConfigValidationError(f"Service definition for '{srv_name}' must be an object (dictionary).")
+        
+        logger_cb(f"  ↳ Validating service definition: '{srv_name}'")
+
+        srv_type = srv_conf.get("type", "local")
+        if srv_type not in ["local", "remote"]:
+            raise ConfigValidationError(f"Service '{srv_name}': 'type' must be 'local' or 'remote'. Got '{srv_type}'.")
+        logger_cb(f"      [Parsed] type: {srv_type}")
+
+        if "service_port" not in srv_conf:
+            raise ConfigValidationError(f"Service '{srv_name}': Missing required key 'service_port'.")
+        if not isinstance(srv_conf["service_port"], int):
+            raise ConfigValidationError(f"Service '{srv_name}': 'service_port' must be an integer.")
+        logger_cb(f"      [Parsed] service_port: {srv_conf['service_port']}")
+
+        if srv_type == "local":
+            if "local_port" not in srv_conf:
+                raise ConfigValidationError(f"Service '{srv_name}': Missing 'local_port' (required for 'local' type services).")
+            if not isinstance(srv_conf["local_port"], int):
+                raise ConfigValidationError(f"Service '{srv_name}': 'local_port' must be an integer.")
+            logger_cb(f"      [Parsed] local_port: {srv_conf['local_port']}")
+        else:
+            if "remote_port" not in srv_conf:
+                raise ConfigValidationError(f"Service '{srv_name}': Missing 'remote_port' (required for 'remote' type services).")
+            if not isinstance(srv_conf["remote_port"], int):
+                raise ConfigValidationError(f"Service '{srv_name}': 'remote_port' must be an integer.")
+            logger_cb(f"      [Parsed] remote_port: {srv_conf['remote_port']}")
+
+        service_host = srv_conf.get("service_host", "127.0.0.1")
+        if not isinstance(service_host, str):
+            raise ConfigValidationError(f"Service '{srv_name}': 'service_host' must be a string.")
+        logger_cb(f"      [Parsed] service_host: {service_host}")
+
+        bind_address = srv_conf.get("bind_address", "127.0.0.1")
+        if not isinstance(bind_address, str):
+            raise ConfigValidationError(f"Service '{srv_name}': 'bind_address' must be a string.")
+        logger_cb(f"      [Parsed] bind_address: {bind_address}")
+
+    logger_cb("Configuration validation complete. No errors found.")
 
 
 def create_boilerplate_config(filepath):
@@ -187,15 +271,27 @@ def check_config_on_startup():
             open_editor(CONFIG_PATH)
 
             try:
-                load_json_with_comments(CONFIG_PATH)
-                print("\n\033[1;32m[✓] Configuration parsed successfully!\033[0m")
+                config_data = load_json_with_comments(CONFIG_PATH)
+                validate_config(config_data, logger_cb=lambda m: print(f"    {m}"))
+                print("\n\033[1;32m[✓] Configuration parsed and validated successfully!\033[0m")
                 time.sleep(1.0)
                 break
-            except Exception as e:
-                print(f"\n\033[1;31m[!] Error parsing configuration file:\033[0m {e}")
+            except ConfigValidationError as e:
+                print(f"\n\033[1;31m[!] Configuration Parsing/Validation Error:\033[0m\n{e}")
                 ans = (
                     input(
-                        "Would you like to reopen the editor to fix the error? [Y/n]: "
+                        "\nWould you like to reopen the editor to fix the error? [Y/n]: "
+                    )
+                    .strip()
+                    .lower()
+                )
+                if ans == "n":
+                    break
+            except Exception as e:
+                print(f"\n\033[1;31m[!] Unexpected Error parsing configuration file:\033[0m\n{e}")
+                ans = (
+                    input(
+                        "\nWould you like to reopen the editor to fix the error? [Y/n]: "
                     )
                     .strip()
                     .lower()
@@ -230,7 +326,7 @@ def fmt_time(seconds: float) -> str:
         return f"{h}h {m}m {s}s"
     if m > 0:
         return f"{m}m {s}s"
-    return f"{int(seconds)}s"  # <--- Changed this line from {seconds:.1f}s
+    return f"{int(seconds)}s"
 
 
 class TunnelStats:
@@ -458,12 +554,12 @@ class TunnelApp(App):
     def __init__(self):
         super().__init__()
         self.stats = TunnelStats()
+        self.log_history = []
         self.config = self.load_config()
         self.running = True
         self.ssh_process = None
         self.intentional_restart = False
         self.sleep_task = None
-        self.log_history = []
 
         self.service_bindings = {}
         self.service_statuses = {}
@@ -476,9 +572,18 @@ class TunnelApp(App):
                 self.service_statuses[srv] = "pending"
 
     def load_config(self):
+        self.log_msg(f"[bold cyan]Trying to read config file '{CONFIG_PATH}'...[/bold cyan]")
+
         try:
-            return load_json_with_comments(CONFIG_PATH)
-        except Exception:
+            config_data = load_json_with_comments(CONFIG_PATH)
+            self.log_msg("[bold cyan]Loading and validating configuration data...[/bold cyan]")
+            validate_config(config_data, logger_cb=lambda m: self.log_msg(f"[dim]{m}[/dim]"))
+            return config_data
+        except ConfigValidationError as e:
+            self.log_msg(f"\n[bold red]Configuration Validation Error:[/bold red]\n[red]{e}[/red]\n")
+            return None
+        except Exception as e:
+            self.log_msg(f"\n[bold red]Unexpected Error parsing config:[/bold red]\n[red]{e}[/red]\n")
             return None
 
     def compose(self) -> ComposeResult:
@@ -715,7 +820,7 @@ class TunnelApp(App):
 
     def action_open_shell(self) -> None:
         if not self.config:
-            self.log_msg("[red]Cannot open shell: No config loaded.[/red]")
+            self.log_msg("[red]Cannot open shell: No valid config loaded.[/red]")
             return
 
         with self.suspend():
@@ -796,7 +901,7 @@ class TunnelApp(App):
             self.restart_tunnel()
         else:
             self.log_msg(
-                "[bold red]Failed to reload config: invalid JSON or missing file.[/bold red]"
+                "[bold red]Failed to apply reloaded config due to parsing errors. Retaining previous stable config.[/bold red]"
             )
 
     @work
@@ -962,7 +1067,7 @@ class TunnelApp(App):
     @work(exclusive=True)
     async def run_ssh_loop(self):
         if not self.config:
-            self.log_msg(f"[red]Error: Could not load config at {CONFIG_PATH}[/red]")
+            self.log_msg(f"[red]Error: System looping stalled without a valid config.[/red]")
             return
 
         self.log_msg(
