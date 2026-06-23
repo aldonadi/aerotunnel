@@ -33,6 +33,8 @@ class ConfigValidationError(Exception):
 def load_json_with_comments(filepath):
     import re
 
+    logger_cb(f"Trying to read config file '{filepath}'")
+
     with open(filepath, "r") as f:
         content = f.read()
 
@@ -574,7 +576,7 @@ class TunnelApp(App):
     def load_config(self):
         try:
             config_data = load_json_with_comments(CONFIG_PATH)
-            self.log_msg("[bold cyan]Loading and validating configuration file...[/bold cyan]")
+            self.log_msg("[bold cyan]Loading and validating configuration data...[/bold cyan]")
             validate_config(config_data, logger_cb=lambda m: self.log_msg(f"[dim]{m}[/dim]"))
             return config_data
         except ConfigValidationError as e:
