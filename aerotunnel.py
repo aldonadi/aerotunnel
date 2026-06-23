@@ -20,9 +20,9 @@ CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
 # Version Information
 MAJOR = 0
 MINOR = 2
-PATCH = 3
+PATCH = 4
 VERSION = f"{MAJOR}.{MINOR}.{PATCH}"
-DATE_RELEASED = "2026-05-24"
+DATE_RELEASED = "2026-06-23"
 
 
 class ConfigValidationError(Exception):
