@@ -572,7 +572,7 @@ class TunnelApp(App):
                 self.service_statuses[srv] = "pending"
 
     def load_config(self):
-        logger_cb(f"Trying to read config file '{CONFIG_PATH}'")
+        self.log_msg(f"[bold cyan]Trying to read config file '{CONFIG_PATH}'...[/bold cyan]")
 
         try:
             config_data = load_json_with_comments(CONFIG_PATH)
