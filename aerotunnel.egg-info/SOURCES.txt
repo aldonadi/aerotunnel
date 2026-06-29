@@ -1,9 +1,0 @@
-README.md
-aerotunnel.py
-pyproject.toml
-aerotunnel.egg-info/PKG-INFO
-aerotunnel.egg-info/SOURCES.txt
-aerotunnel.egg-info/dependency_links.txt
-aerotunnel.egg-info/entry_points.txt
-aerotunnel.egg-info/requires.txt
-aerotunnel.egg-info/top_level.txt
