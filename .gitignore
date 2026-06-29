@@ -1,2 +1,4 @@
 *.pyc
 
+build/
+aerotunnel.egg-info/
