@@ -9,7 +9,7 @@ from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.containers import Container
-from textual.widgets import Header, Footer, Static, DataTable, RichLog, Label
+from textual.widgets import Header, Footer, Static, DataTable, RichLog, Label, Input, Button
 from textual.screen import ModalScreen
 from textual import work, events
 
@@ -464,7 +464,7 @@ class BindingModal(ModalScreen[dict]):
         if table.row_count == 0:
             return
 
-        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
+        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
         srv = row_key.value
 
         current_ip = self.working_bindings[srv]
@@ -478,6 +478,36 @@ class BindingModal(ModalScreen[dict]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
+
+
+# --- SSH PASSWORD PROMPT MODAL ---
+class SshPasswordPrompt(ModalScreen[str]):
+    def __init__(self):
+        super().__init__()
+
+    def compose(self) -> ComposeResult:
+        yield Container(
+            Label("[bold cyan]SSH Password Required[/bold cyan]\n[dim]Enter password to proceed[/dim]", id="dialog_title"),
+            Input(placeholder="Enter SSH password", password=True, id="password_input"),
+            Container(
+                Button("Submit", id="submit_btn"),
+                Button("Cancel", id="cancel_btn"),
+                id="button_container"
+            ),
+            id="dialog",
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "submit_btn":
+            input_widget = self.query_one("#password_input", Input)
+            password = input_widget.value
+            self.dismiss(password)
+        elif event.button.id == "cancel_btn":
+            self.dismiss(None)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Optional: Clear error messages when user types
+        pass
 
 
 # --- LOGGING MODAL ---
@@ -1137,6 +1167,7 @@ class TunnelApp(App):
                         *cmd,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
+                        stdin=asyncio.subprocess.PIPE,
                     )
 
                     stderr_lines = []
@@ -1149,6 +1180,11 @@ class TunnelApp(App):
                             line_str = line.decode().strip()
                             if is_stderr:
                                 stderr_lines.append(line_str)
+                                # Check for password prompt
+                                if "password:" in line_str.lower() or "passphrase:" in line_str.lower():
+                                    self.log_msg("[bold yellow]SSH is asking for a password. [/bold yellow]")
+                                    self.log_msg("[yellow]This may be because no SSH keys are loaded in ssh-agent.[/yellow]")
+                                    self.log_msg("[yellow]Please check your SSH agent and keys, or try connecting manually.[/yellow]")
                             color = "red" if is_stderr else "dim white"
                             self.log_msg(f"[{color}][SSH] {line_str}[/{color}]")
 
