@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 import os
+import re
+import sys
 import json
+import stat
 import time
-import asyncio
-import subprocess
+import shlex
 import shutil
+import socket
+import asyncio
+import secrets
+import tempfile
+import threading
+import subprocess
 from datetime import datetime
 
 from textual.app import App, ComposeResult
@@ -14,6 +22,7 @@ from textual.screen import ModalScreen
 from textual import work, events
 
 from rich.table import Table
+from rich.markup import escape
 
 CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
 
@@ -24,15 +33,131 @@ PATCH = 4
 VERSION = f"{MAJOR}.{MINOR}.{PATCH}"
 DATE_RELEASED = "2026-06-23"
 
+# Timing & Notification Constants
+STABILITY_WAIT_SEC = 6.0
+RECONNECT_DELAY_SEC = 5.0
+WIDE_TABLE_MIN_WIDTH = 84
+MOBILE_SCREEN_MAX_WIDTH = 79
+
 
 class ConfigValidationError(Exception):
     """Custom exception for configuration parsing and validation errors."""
     pass
 
 
-def load_json_with_comments(filepath):
-    import re
+def format_ssh_host(host: str) -> str:
+    """Wrap bare IPv6 literals in brackets for OpenSSH -L/-R specs."""
+    if ":" in host and not (host.startswith("[") and host.endswith("]")):
+        return f"[{host}]"
+    return host
 
+
+def _is_valid_port(val) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool) and 1 <= val <= 65535
+
+
+def is_ssh_password_prompt(text: str) -> bool:
+    """Return True if a line/chunk looks like an interactive SSH credential prompt."""
+    lower = text.strip().lower()
+    if not lower:
+        return False
+    # Ignore failure/diagnostic lines that happen to mention auth keywords
+    if any(
+        err in lower
+        for err in (
+            "permission denied",
+            "authentication failed",
+            "connection closed",
+            "address already in use",
+        )
+    ):
+        return False
+    if re.search(r"\b(password|passphrase)\b\s*:", lower):
+        return True
+    if re.search(r"\benter\s+(?:password|passphrase)\b.*:\s*$", lower):
+        return True
+    if re.search(r"\b(verification code|one-time password|otp|pin)\b\s*:\s*$", lower):
+        return True
+    return False
+
+
+def detect_failed_forward_services(stderr_lines, active_services, services_config):
+    """Identify which services in active_services failed to bind from SSH stderr lines."""
+    failed = set()
+    for line in stderr_lines:
+        lower = line.lower()
+        if "remote port forwarding failed" in lower:
+            m = re.search(r"(?:listen\s+port|port)\s+(\d+)\b", line, re.IGNORECASE)
+            if m:
+                port = int(m.group(1))
+                for srv in active_services:
+                    conf = services_config[srv]
+                    if conf.get("type", "local") == "remote" and conf.get("remote_port") == port:
+                        failed.add(srv)
+        elif "address already in use" in lower or "cannot listen to port" in lower:
+            m = re.search(r"(?:\]:|port:\s*)(\d+)\b", line, re.IGNORECASE)
+            if m:
+                port = int(m.group(1))
+                matched_local = False
+                for srv in active_services:
+                    conf = services_config[srv]
+                    if conf.get("type", "local") == "local" and conf.get("local_port") == port:
+                        failed.add(srv)
+                        matched_local = True
+                if not matched_local:
+                    for srv in active_services:
+                        conf = services_config[srv]
+                        if conf.get("type", "local") == "remote" and conf.get("remote_port") == port:
+                            failed.add(srv)
+    return failed
+
+
+def create_askpass_helper(askpass_dir: str, sock_path: str, token: str) -> str:
+    """Create an executable SSH_ASKPASS helper that proxies prompts over a Unix socket."""
+    py_path = os.path.join(askpass_dir, "askpass.py")
+    sh_path = os.path.join(askpass_dir, "askpass.sh")
+
+    py_body = f"""import json
+import socket
+import sys
+
+prompt = sys.argv[1] if len(sys.argv) > 1 else "Password:"
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    sock.connect({sock_path!r})
+    payload = json.dumps({{"token": {token!r}, "prompt": prompt}}) + "\\n"
+    sock.sendall(payload.encode("utf-8"))
+    data = b""
+    while not data.endswith(b"\\n"):
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+finally:
+    sock.close()
+
+if not data:
+    sys.exit(1)
+
+resp = json.loads(data.decode("utf-8"))
+if resp.get("cancel") or "password" not in resp:
+    sys.exit(1)
+
+sys.stdout.write(resp["password"] + "\\n")
+sys.stdout.flush()
+"""
+    with open(py_path, "w") as f:
+        f.write(py_body)
+    os.chmod(py_path, stat.S_IRUSR | stat.S_IWUSR)
+
+    sh_body = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(py_path)} \"$@\"\n"
+    with open(sh_path, "w") as f:
+        f.write(sh_body)
+    os.chmod(sh_path, stat.S_IRWXU)
+    return sh_path
+
+
+def load_json_with_comments(filepath):
     with open(filepath, "r") as f:
         content = f.read()
 
@@ -80,7 +205,6 @@ def validate_config(data, logger_cb=print):
 
     required_root_keys = {
         "remote_host": str,
-        "remote_port": int,
         "remote_user": str,
         "services": dict
     }
@@ -94,6 +218,14 @@ def validate_config(data, logger_cb=print):
         
         if key != "services":
             logger_cb(f"[Parsed] {key}: {data[key]}")
+
+    if "remote_port" not in data:
+        data["remote_port"] = 22
+        logger_cb("[Parsed] remote_port: 22 (default)")
+    else:
+        if not _is_valid_port(data["remote_port"]):
+            raise ConfigValidationError("The 'remote_port' setting must be a valid port integer (1-65535).")
+        logger_cb(f"[Parsed] remote_port: {data['remote_port']}")
 
     logger_cb(f"[Parsed] Found {len(data['services'])} service(s) to map in 'services' block.")
 
@@ -110,21 +242,21 @@ def validate_config(data, logger_cb=print):
 
         if "service_port" not in srv_conf:
             raise ConfigValidationError(f"Service '{srv_name}': Missing required key 'service_port'.")
-        if not isinstance(srv_conf["service_port"], int):
-            raise ConfigValidationError(f"Service '{srv_name}': 'service_port' must be an integer.")
+        if not _is_valid_port(srv_conf["service_port"]):
+            raise ConfigValidationError(f"Service '{srv_name}': 'service_port' must be a valid port integer (1-65535).")
         logger_cb(f"      [Parsed] service_port: {srv_conf['service_port']}")
 
         if srv_type == "local":
             if "local_port" not in srv_conf:
                 raise ConfigValidationError(f"Service '{srv_name}': Missing 'local_port' (required for 'local' type services).")
-            if not isinstance(srv_conf["local_port"], int):
-                raise ConfigValidationError(f"Service '{srv_name}': 'local_port' must be an integer.")
+            if not _is_valid_port(srv_conf["local_port"]):
+                raise ConfigValidationError(f"Service '{srv_name}': 'local_port' must be a valid port integer (1-65535).")
             logger_cb(f"      [Parsed] local_port: {srv_conf['local_port']}")
         else:
             if "remote_port" not in srv_conf:
                 raise ConfigValidationError(f"Service '{srv_name}': Missing 'remote_port' (required for 'remote' type services).")
-            if not isinstance(srv_conf["remote_port"], int):
-                raise ConfigValidationError(f"Service '{srv_name}': 'remote_port' must be an integer.")
+            if not _is_valid_port(srv_conf["remote_port"]):
+                raise ConfigValidationError(f"Service '{srv_name}': 'remote_port' must be a valid port integer (1-65535).")
             logger_cb(f"      [Parsed] remote_port: {srv_conf['remote_port']}")
 
         service_host = srv_conf.get("service_host", "127.0.0.1")
@@ -380,11 +512,14 @@ class HelpScreen(ModalScreen):
     BINDINGS = [("escape", "app.pop_screen", "Close"), ("h", "app.pop_screen", "Close")]
 
     def compose(self) -> ComposeResult:
-        help_text = f"""[bold cyan]▲ LOCAL LLM TUNNEL // HELP & CONTROLS[/bold cyan]
+        help_text = f"""[bold cyan]▲ AEROTUNNEL // HELP & CONTROLS[/bold cyan]
 
 [bold]Keyboard Shortcuts:[/bold]
+• [yellow]Enter / Space[/yellow] : Expand or Collapse Service Row
+  [dim]Inspect full tunnel details (type, bind listen address, and target destination host/port) inline.[/dim]
+
 • [yellow]b[/yellow] : Configure Network Bindings
-  [dim]Selectively expose services to your local network (0.0.0.0) or restrict them to your device only (127.0.0.1).[/dim]
+  [dim]Selectively expose services to your network (0.0.0.0) or restrict them to loopback only (127.0.0.1).[/dim]
 
 • [yellow]l[/yellow] : View System Logs
   [dim]Opens the raw SSH output buffer. Essential for debugging connection drops or auth failures.[/dim]
@@ -427,7 +562,7 @@ class BindingModal(ModalScreen[dict]):
     def compose(self) -> ComposeResult:
         yield Container(
             Label(
-                "[bold cyan]Configure Local Network Bindings[/bold cyan]\n[dim]Up/Down to select • Space to toggle • Enter to apply[/dim]",
+                "[bold cyan]Configure Service Network Bindings[/bold cyan]\n[dim]Up/Down to select • Space to toggle • Enter to apply[/dim]",
                 id="dialog_title",
             ),
             DataTable(id="binding_table"),
@@ -464,7 +599,7 @@ class BindingModal(ModalScreen[dict]):
         if table.row_count == 0:
             return
 
-        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        row_key = table.coordinate_to_cell_key(table.cursor_coordinate).row_key
         srv = row_key.value
 
         current_ip = self.working_bindings[srv]
@@ -482,32 +617,42 @@ class BindingModal(ModalScreen[dict]):
 
 # --- SSH PASSWORD PROMPT MODAL ---
 class SshPasswordPrompt(ModalScreen[str]):
-    def __init__(self):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, prompt_text: str = "Enter SSH password or passphrase to proceed"):
         super().__init__()
+        self.prompt_text = prompt_text
 
     def compose(self) -> ComposeResult:
         yield Container(
-            Label("[bold cyan]SSH Password Required[/bold cyan]\n[dim]Enter password to proceed[/dim]", id="dialog_title"),
-            Input(placeholder="Enter SSH password", password=True, id="password_input"),
+            Label(
+                f"[bold cyan]SSH Authentication Required[/bold cyan]\n[dim]{escape(self.prompt_text)}[/dim]",
+                id="dialog_title",
+            ),
+            Input(placeholder="Enter password / passphrase", password=True, id="password_input"),
             Container(
-                Button("Submit", id="submit_btn"),
+                Button("Submit", variant="primary", id="submit_btn"),
                 Button("Cancel", id="cancel_btn"),
-                id="button_container"
+                id="button_container",
             ),
             id="dialog",
         )
 
+    def on_mount(self) -> None:
+        self.query_one("#password_input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "submit_btn":
             input_widget = self.query_one("#password_input", Input)
-            password = input_widget.value
-            self.dismiss(password)
+            self.dismiss(input_widget.value)
         elif event.button.id == "cancel_btn":
             self.dismiss(None)
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        # Optional: Clear error messages when user types
-        pass
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 # --- LOGGING MODAL ---
@@ -534,7 +679,7 @@ class TunnelApp(App):
     Screen {
         layout: grid;
         grid-size: 2 1; 
-        grid-columns: 1fr 1fr;
+        grid-columns: 5fr 7fr;
         padding: 1;
     }
     
@@ -553,7 +698,7 @@ class TunnelApp(App):
     #stats_container { border: round magenta; border-title-color: magenta; }
     #services_container { border-title-color: cyan; }
     
-    LogScreen, BindingModal, HelpScreen {
+    LogScreen, BindingModal, HelpScreen, SshPasswordPrompt {
         align: center middle;
         background: $background 80%;
     }
@@ -569,6 +714,8 @@ class TunnelApp(App):
     #log_panel { height: 90%; }
     #help_panel, #dialog { height: auto; }
     #dialog_title { text-align: center; margin-bottom: 1; width: 100%; }
+    #button_container { layout: horizontal; height: auto; align: center middle; margin-top: 1; }
+    #button_container Button { margin: 0 1; }
     """
 
     BINDINGS = [
@@ -590,6 +737,13 @@ class TunnelApp(App):
         self.ssh_process = None
         self.intentional_restart = False
         self.sleep_task = None
+
+        self._auth_lock = asyncio.Lock()
+        self._auth_prompt_active = False
+        self._auth_cancelled = False
+        self._active_password_modal = None
+        self._askpass_server = None
+        self._askpass_dir = None
 
         self.service_bindings = {}
         self.service_statuses = {}
@@ -641,38 +795,99 @@ class TunnelApp(App):
         table.cursor_type = "row"
 
         self.update_services_table()
+        self.update_ui()
         self.set_interval(1.0, self.update_ui)
         self.run_ssh_loop()
 
     def on_unmount(self) -> None:
         self.running = False
+        if self._active_password_modal is not None:
+            try:
+                self._active_password_modal.dismiss(None)
+            except Exception:
+                pass
+        if self.sleep_task:
+            self.sleep_task.cancel()
+        if self._askpass_server is not None:
+            try:
+                self._askpass_server.close()
+            except Exception:
+                pass
+        if self._askpass_dir and os.path.exists(self._askpass_dir):
+            shutil.rmtree(self._askpass_dir, ignore_errors=True)
+            self._askpass_dir = None
         if self.ssh_process:
             try:
                 self.ssh_process.terminate()
             except Exception:
                 pass
 
+    def _is_compact_table(self, screen_width=None) -> bool:
+        width = screen_width if screen_width is not None else self.size.width
+        if not width:
+            return False
+        if width <= MOBILE_SCREEN_MAX_WIDTH:
+            return True
+        # Desktop uses 5fr : 7fr columns with 2 chars screen padding and 4 chars container chrome
+        est_panel_width = int((width - 2) * (7 / 12)) - 4
+        return est_panel_width < WIDE_TABLE_MIN_WIDTH
+
     def on_resize(self, event: events.Resize) -> None:
-        if event.size.width < 80:
+        if event.size.width <= MOBILE_SCREEN_MAX_WIDTH:
             self.screen.add_class("mobile_layout")
         else:
             self.screen.remove_class("mobile_layout")
-        self.update_services_table()
+        self.update_services_table(screen_width=event.size.width)
 
-    def update_services_table(self):
+    @staticmethod
+    def _compact_target_label(service_host: str, service_port: int) -> str:
+        if service_host in ("127.0.0.1", "localhost"):
+            return str(service_port)
+        host_short = service_host if len(service_host) <= 7 else f"{service_host[:6]}…"
+        return f"{host_short}:{service_port}"
+
+    def _resolve_parent_service(self, row_key: str):
+        if not self.config:
+            return None
+        services = self.config.get("services", {})
+        if row_key in services:
+            return row_key
+        if row_key.endswith(("_sub_type", "_sub_listen", "_sub_dest")):
+            prefix = row_key.rsplit("_sub_", 1)[0]
+            if prefix in services:
+                return prefix
+        return None
+
+    def _toggle_service_row(self, row_key: str) -> bool:
+        parent_service = self._resolve_parent_service(row_key)
+        if not parent_service:
+            return False
+        focus_key = None
+        if parent_service in self.expanded_services:
+            self.expanded_services.remove(parent_service)
+            if row_key != parent_service:
+                focus_key = parent_service
+        else:
+            self.expanded_services.add(parent_service)
+        self.update_services_table(focus_row_key=focus_key)
+        return True
+
+    def update_services_table(self, focus_row_key=None, screen_width=None):
         table = self.query_one("#services_table", DataTable)
 
-        # Remember current cursor coordinate to restore focus/scroll position!
-        try:
-            old_coordinate = table.cursor_coordinate
-            old_row_key = table.coordinate_to_cell_key(old_coordinate).row_key.value
-        except Exception:
-            old_row_key = None
+        if focus_row_key is not None:
+            old_row_key = focus_row_key
+        else:
+            try:
+                old_coordinate = table.cursor_coordinate
+                old_row_key = table.coordinate_to_cell_key(old_coordinate).row_key.value
+            except Exception:
+                old_row_key = None
 
         table.clear(columns=True)
 
-        is_mobile = self.screen.has_class("mobile_layout")
-        if is_mobile:
+        is_compact = self._is_compact_table(screen_width=screen_width)
+        if is_compact:
             table.add_columns("Service", "Tunnel Map", "Status")
         else:
             table.add_columns(
@@ -698,6 +913,7 @@ class TunnelApp(App):
                     if bind_ip == "0.0.0.0"
                     else f"[bold green]{bind_ip}[/]"
                 )
+                listen_display = f"{bind_display}:{listen_port}"
 
                 status_val = self.service_statuses.get(name, "pending")
                 if status_val == "active":
@@ -707,11 +923,17 @@ class TunnelApp(App):
                 else:
                     status_display = "[bold yellow]⏳ PENDING[/]"
 
-                if is_mobile:
+                if is_compact:
+                    compact_bind = (
+                        "[bold white on red]0.0.0.0[/]"
+                        if bind_ip == "0.0.0.0"
+                        else f"[bold green]{bind_ip}[/]"
+                    )
+                    target_compact = self._compact_target_label(service_host, service_port)
                     if srv_type == "remote":
-                        map_str = f"[bold cyan][R][/] {bind_display}:{listen_port} [yellow]↢[/] {listen_port}"
+                        map_str = f"[bold cyan][R][/] {compact_bind}:{listen_port} [yellow]↢[/] {target_compact}"
                     else:
-                        map_str = f"[bold cyan][L][/] {bind_display}:{listen_port} [yellow]↣[/] {service_port}"
+                        map_str = f"[bold cyan][L][/] {compact_bind}:{listen_port} [yellow]↣[/] {target_compact}"
 
                     table.add_row(
                         name.upper().replace("_", "-"),
@@ -719,13 +941,28 @@ class TunnelApp(App):
                         status_display,
                         key=name,
                     )
+                else:
+                    flow_str = (
+                        "[yellow]↢ [R] ↢[/]"
+                        if srv_type == "remote"
+                        else "[yellow]↣ [L] ↣[/]"
+                    )
+                    table.add_row(
+                        name.upper().replace("_", "-"),
+                        listen_display,
+                        flow_str,
+                        f"{service_host}:{service_port}",
+                        status_display,
+                        key=name,
+                    )
 
-                    if name in self.expanded_services:
-                        type_str = (
-                            "Remote Forwarding (-R)"
-                            if srv_type == "remote"
-                            else "Local Forwarding (-L)"
-                        )
+                if name in self.expanded_services:
+                    type_str = (
+                        "Remote Forwarding (-R)"
+                        if srv_type == "remote"
+                        else "Local Forwarding (-L)"
+                    )
+                    if is_compact:
                         table.add_row(
                             "  [dim]↳ Type:[/dim]",
                             f"[cyan]{type_str}[/]",
@@ -734,7 +971,7 @@ class TunnelApp(App):
                         )
                         table.add_row(
                             "  [dim]↳ Listen:[/dim]",
-                            f"[green]{bind_ip}:{listen_port}[/]",
+                            listen_display,
                             "",
                             key=f"{name}_sub_listen",
                         )
@@ -744,28 +981,7 @@ class TunnelApp(App):
                             "",
                             key=f"{name}_sub_dest",
                         )
-                else:
-                    flow_str = (
-                        "[yellow]↢ [R] ↢[/]"
-                        if srv_type == "remote"
-                        else "[yellow]↣ [L] ↣[/]"
-                    )
-
-                    table.add_row(
-                        name.upper().replace("_", "-"),
-                        f"{bind_display}:{listen_port}",
-                        flow_str,
-                        f"{service_host}:{service_port}",
-                        status_display,
-                        key=name,
-                    )
-
-                    if name in self.expanded_services:
-                        type_str = (
-                            "Remote Forwarding (-R)"
-                            if srv_type == "remote"
-                            else "Local Forwarding (-L)"
-                        )
+                    else:
                         table.add_row(
                             "  [dim]↳ Type:[/dim]",
                             f"[cyan]{type_str}[/]",
@@ -776,7 +992,7 @@ class TunnelApp(App):
                         )
                         table.add_row(
                             "  [dim]↳ Listen:[/dim]",
-                            f"[green]{bind_ip}:{listen_port}[/]",
+                            listen_display,
                             "",
                             "",
                             "",
@@ -784,9 +1000,9 @@ class TunnelApp(App):
                         )
                         table.add_row(
                             "  [dim]↳ Target:[/dim]",
+                            "",
+                            "",
                             f"[white]{service_host}:{service_port}[/]",
-                            "",
-                            "",
                             "",
                             key=f"{name}_sub_dest",
                         )
@@ -801,43 +1017,19 @@ class TunnelApp(App):
                 pass
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        row_key = event.row_key.value
-        parent_service = None
-        if row_key in self.config.get("services", {}):
-            parent_service = row_key
-        else:
-            for srv in self.config.get("services", {}):
-                if row_key.startswith(f"{srv}_sub_"):
-                    parent_service = srv
-                    break
-        if parent_service:
-            if parent_service in self.expanded_services:
-                self.expanded_services.remove(parent_service)
-            else:
-                self.expanded_services.add(parent_service)
-            self.update_services_table()
+        self._toggle_service_row(event.row_key.value)
 
     def on_key(self, event: events.Key) -> None:
-        if event.key == "space":
-            table = self.query_one("#services_table", DataTable)
-            if table.has_focus:
+        if event.key == "space" and not self.screen.is_modal:
+            try:
+                table = self.query_one("#services_table", DataTable)
+            except Exception:
+                return
+            if self.focused is table:
                 try:
                     coordinate = table.cursor_coordinate
                     row_key = table.coordinate_to_cell_key(coordinate).row_key.value
-                    parent_service = None
-                    if row_key in self.config.get("services", {}):
-                        parent_service = row_key
-                    else:
-                        for srv in self.config.get("services", {}):
-                            if row_key.startswith(f"{srv}_sub_"):
-                                parent_service = srv
-                                break
-                    if parent_service:
-                        if parent_service in self.expanded_services:
-                            self.expanded_services.remove(parent_service)
-                        else:
-                            self.expanded_services.add(parent_service)
-                        self.update_services_table()
+                    if self._toggle_service_row(row_key):
                         event.prevent_default()
                 except Exception:
                     pass
@@ -874,7 +1066,7 @@ class TunnelApp(App):
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "-p",
-                str(self.config["remote_port"]),
+                str(self.config.get("remote_port", 22)),
                 f"{self.config['remote_user']}@{self.config['remote_host']}",
             ]
 
@@ -903,6 +1095,7 @@ class TunnelApp(App):
             open_editor(CONFIG_PATH)
             time.sleep(0.5)
 
+        old_services = self.config.get("services", {}) if self.config else {}
         new_config = self.load_config()
         if new_config:
             self.config = new_config
@@ -912,9 +1105,12 @@ class TunnelApp(App):
             new_bindings = {}
             new_statuses = {}
             for srv, srv_conf in self.config.get("services", {}).items():
-                new_bindings[srv] = self.service_bindings.get(
-                    srv, srv_conf.get("bind_address", "127.0.0.1")
-                )
+                new_file_bind = srv_conf.get("bind_address", "127.0.0.1")
+                old_file_bind = old_services.get(srv, {}).get("bind_address", "127.0.0.1")
+                if srv in self.service_bindings and new_file_bind == old_file_bind:
+                    new_bindings[srv] = self.service_bindings[srv]
+                else:
+                    new_bindings[srv] = new_file_bind
                 new_statuses[srv] = "pending"
             self.service_bindings = new_bindings
             self.service_statuses = new_statuses
@@ -948,6 +1144,12 @@ class TunnelApp(App):
     def restart_tunnel(self):
         self.intentional_restart = True
         self.is_partial_mode = False
+        self._auth_cancelled = False
+        if self._active_password_modal is not None:
+            try:
+                self._active_password_modal.dismiss(None)
+            except Exception:
+                pass
         if self.ssh_process:
             try:
                 self.ssh_process.terminate()
@@ -981,7 +1183,11 @@ class TunnelApp(App):
             if self.is_screen_installed("log_screen"):
                 log_screen = self.get_screen("log_screen")
                 logger = log_screen.query_one(RichLog)
-                self.call_from_thread(logger.write, formatted_msg)
+                app_thread_id = getattr(self, "_thread_id", threading.get_ident())
+                if threading.get_ident() == app_thread_id:
+                    logger.write(formatted_msg)
+                else:
+                    self.call_from_thread(logger.write, formatted_msg)
         except Exception:
             pass
 
@@ -1018,7 +1224,7 @@ class TunnelApp(App):
         remote_port = "N/A"
         if self.config:
             remote_host = f"[bold cyan]{self.config.get('remote_user', '')}@{self.config.get('remote_host', '')}[/]"
-            remote_port = f"[bold cyan]{self.config.get('remote_port', '')}[/]"
+            remote_port = f"[bold cyan]{self.config.get('remote_port', 22)}[/]"
 
         table.add_row("Remote Host:", remote_host, "SSH Port:", remote_port)
         table.add_row(
@@ -1094,19 +1300,92 @@ class TunnelApp(App):
         if self.stats.first_success == "N/A":
             self.stats.first_success = datetime.now().strftime("%H:%M:%S")
 
+    async def _start_askpass_server(self):
+        self._askpass_dir = tempfile.mkdtemp(prefix="at_")
+        os.chmod(self._askpass_dir, stat.S_IRWXU)
+        sock_path = os.path.join(self._askpass_dir, "s")
+        token = secrets.token_hex(16)
+        script_path = create_askpass_helper(self._askpass_dir, sock_path, token)
+
+        async def handle_client(reader, writer):
+            try:
+                raw = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                if not raw:
+                    return
+                req = json.loads(raw.decode("utf-8"))
+                if not secrets.compare_digest(req.get("token", ""), token) or not self.running:
+                    writer.write(b'{"cancel": true}\n')
+                    await writer.drain()
+                    return
+
+                prompt_text = str(req.get("prompt", "Enter SSH password:"))
+                async with self._auth_lock:
+                    if self._auth_cancelled or not self.running:
+                        writer.write(b'{"cancel": true}\n')
+                        await writer.drain()
+                        return
+
+                    self._auth_prompt_active = True
+                    self.stats.status = "Password Required"
+                    self.log_msg(f"[bold yellow]SSH is asking for a password:[/bold yellow] {prompt_text}")
+                    modal = SshPasswordPrompt(prompt_text=prompt_text)
+                    self._active_password_modal = modal
+                    try:
+                        password = await self.push_screen_wait(modal)
+                    finally:
+                        self._active_password_modal = None
+                        self._auth_prompt_active = False
+
+                    if password is None:
+                        self._auth_cancelled = True
+                        writer.write(b'{"cancel": true}\n')
+                        await writer.drain()
+                        if self.ssh_process and self.ssh_process.returncode is None:
+                            try:
+                                self.ssh_process.terminate()
+                            except Exception:
+                                pass
+                    else:
+                        payload = (json.dumps({"password": password}) + "\n").encode("utf-8")
+                        writer.write(payload)
+                        await writer.drain()
+            except Exception:
+                try:
+                    writer.write(b'{"cancel": true}\n')
+                    await writer.drain()
+                except Exception:
+                    pass
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        self._askpass_server = await asyncio.start_unix_server(handle_client, path=sock_path)
+        os.chmod(sock_path, stat.S_IRUSR | stat.S_IWUSR)
+        return script_path
+
     @work(exclusive=True)
     async def run_ssh_loop(self):
         if not self.config:
-            self.log_msg(f"[red]Error: System looping stalled without a valid config.[/red]")
+            self.log_msg("[red]Error: System looping stalled without a valid config.[/red]")
             return
 
         self.log_msg(
             "[bold cyan]System Initialized. Starting routing loop...[/bold cyan]"
         )
 
+        askpass_script = None
+        try:
+            askpass_script = await self._start_askpass_server()
+        except Exception as e:
+            self.log_msg(f"[yellow]Askpass helper unavailable ({e}); continuing without interactive auth modal.[/yellow]")
+
         try:
             while self.running:
                 self.intentional_restart = False
+                self._auth_cancelled = False
 
                 # If not in partial mode, this is a fresh attempt to bind all configured services
                 if not self.is_partial_mode:
@@ -1130,16 +1409,18 @@ class TunnelApp(App):
                     "-o",
                     "StrictHostKeyChecking=accept-new",
                     "-p",
-                    str(self.config["remote_port"]),
+                    str(self.config.get("remote_port", 22)),
                 ]
 
                 for srv_name in self.active_services_to_bind:
                     srv_conf = self.config["services"][srv_name]
                     srv_type = srv_conf.get("type", "local")
-                    service_host = srv_conf.get("service_host", "127.0.0.1")
+                    service_host = format_ssh_host(srv_conf.get("service_host", "127.0.0.1"))
                     service_port = srv_conf["service_port"]
-                    bind_ip = self.service_bindings.get(
-                        srv_name, srv_conf.get("bind_address", "127.0.0.1")
+                    bind_ip = format_ssh_host(
+                        self.service_bindings.get(
+                            srv_name, srv_conf.get("bind_address", "127.0.0.1")
+                        )
                     )
 
                     if srv_type == "remote":
@@ -1162,47 +1443,134 @@ class TunnelApp(App):
                 cmd.append(f"{self.config['remote_user']}@{self.config['remote_host']}")
                 self.log_msg(f"[yellow]Spawning Subprocess:[/yellow] {' '.join(cmd)}")
 
+                env = os.environ.copy()
+                if askpass_script:
+                    env["SSH_ASKPASS"] = askpass_script
+                    env["SSH_ASKPASS_REQUIRE"] = "force"
+                    if not env.get("DISPLAY"):
+                        env["DISPLAY"] = ":0"
+
                 try:
                     self.ssh_process = await asyncio.create_subprocess_exec(
                         *cmd,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        stdin=asyncio.subprocess.PIPE,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        start_new_session=True,
+                        env=env,
                     )
 
                     stderr_lines = []
+                    stderr_password_detected = False
+
+                    def handle_stream_line(line_str: str, is_stderr: bool):
+                        nonlocal stderr_password_detected
+                        if is_stderr:
+                            stderr_lines.append(line_str)
+                            if is_ssh_password_prompt(line_str):
+                                stderr_password_detected = True
+                                self.stats.status = "Password Required"
+                                self.log_msg("[bold yellow]SSH is asking for a password.[/bold yellow]")
+                                self.log_msg("[yellow]This may be because no SSH keys are loaded in ssh-agent.[/yellow]")
+                                self.log_msg("[yellow]Please check your SSH agent and keys, or try connecting manually.[/yellow]")
+                        color = "red" if is_stderr else "dim white"
+                        self.log_msg(f"[{color}][SSH] {line_str}[/{color}]")
 
                     async def read_stream(stream, is_stderr=False):
+                        if stream is None:
+                            return
+                        buf = ""
+                        last_partial_logged = ""
                         while True:
-                            line = await stream.readline()
-                            if not line:
+                            chunk = await stream.read(1024)
+                            if not chunk:
+                                rem = buf.strip()
+                                if rem and rem != last_partial_logged:
+                                    handle_stream_line(rem, is_stderr)
                                 break
-                            line_str = line.decode().strip()
-                            if is_stderr:
-                                stderr_lines.append(line_str)
-                                # Check for password prompt
-                                if any(pattern in line_str.lower() for pattern in ("password:", "passphrase:")):
-                                    self.log_msg("[bold yellow]SSH is asking for a password. [/bold yellow]")
-                                    self.log_msg("[yellow]This may be because no SSH keys are loaded in ssh-agent.[/yellow]")
-                                    self.log_msg("[yellow]Please check your SSH agent and keys, or try connecting manually.[/yellow]")
-                                    # Note: In a full implementation, we would present a password modal here
-                                    # But due to complexities of Textual's async model and SSH I/O, we simply log the issue
-                            color = "red" if is_stderr else "dim white"
-                            self.log_msg(f"[{color}][SSH] {line_str}[/{color}]")
+                            buf += chunk.decode(errors="replace")
+                            while "\n" in buf or "\r" in buf:
+                                idx_n = buf.find("\n")
+                                idx_r = buf.find("\r")
+                                if idx_n == -1:
+                                    idx = idx_r
+                                elif idx_r == -1:
+                                    idx = idx_n
+                                else:
+                                    idx = min(idx_n, idx_r)
+                                line_str = buf[:idx].strip()
+                                buf = buf[idx + 1 :]
+                                if line_str and line_str != last_partial_logged:
+                                    handle_stream_line(line_str, is_stderr)
+                                last_partial_logged = ""
+                            partial = buf.strip()
+                            if (
+                                is_stderr
+                                and partial
+                                and partial != last_partial_logged
+                                and is_ssh_password_prompt(partial)
+                            ):
+                                handle_stream_line(partial, is_stderr=True)
+                                last_partial_logged = partial
 
-                    asyncio.create_task(read_stream(self.ssh_process.stdout))
-                    asyncio.create_task(read_stream(self.ssh_process.stderr, True))
+                    stream_tasks = [
+                        asyncio.create_task(read_stream(self.ssh_process.stdout, False)),
+                        asyncio.create_task(read_stream(self.ssh_process.stderr, True)),
+                    ]
 
-                    # We give SSH exactly 6 seconds to prove it's stable.
-                    try:
-                        await asyncio.wait_for(self.ssh_process.wait(), timeout=6.0)
+                    # Wait STABILITY_WAIT_SEC excluding time spent inside interactive password prompts
+                    stable_elapsed = 0.0
+                    exited_early = False
+                    last_tick = time.monotonic()
+                    while self.ssh_process.returncode is None:
+                        now = time.monotonic()
+                        dt = now - last_tick
+                        last_tick = now
+                        if self._auth_prompt_active:
+                            stable_elapsed = 0.0
+                        else:
+                            stable_elapsed += dt
+                            if stable_elapsed >= STABILITY_WAIT_SEC:
+                                break
+                        try:
+                            await asyncio.wait_for(self.ssh_process.wait(), timeout=0.05)
+                            exited_early = True
+                            break
+                        except asyncio.TimeoutError:
+                            pass
 
-                        # If it exits before 6 seconds, the connection failed early.
+                    if exited_early:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*stream_tasks, return_exceptions=True),
+                                timeout=0.2,
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+
+                        if self.intentional_restart:
+                            self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
+                            self.stats.record_disconnect()
+                            continue
+
+                        if self._auth_cancelled:
+                            self.log_msg(
+                                "[bold yellow]Authentication cancelled by user. Press 'r' to retry or 'c' to edit config.[/bold yellow]"
+                            )
+                            self.stats.status = "Auth Cancelled"
+                            try:
+                                self.sleep_task = asyncio.create_task(asyncio.Future())
+                                await self.sleep_task
+                            except asyncio.CancelledError:
+                                pass
+                            continue
+
+                        # Connection failed before stability window completed
                         err_msg = "Connection rejected or unreachable"
                         status_str = "Host Unreachable"
 
                         stderr_content = "\n".join(stderr_lines).lower()
-                        if "permission denied" in stderr_content:
+                        if "permission denied" in stderr_content or stderr_password_detected:
                             status_str = "Auth Failure"
                             err_msg = "Permission denied (auth failure)"
                         elif "connection refused" in stderr_content:
@@ -1227,6 +1595,7 @@ class TunnelApp(App):
                         elif (
                             "address already in use" in stderr_content
                             or "cannot listen to port" in stderr_content
+                            or "remote port forwarding failed" in stderr_content
                         ):
                             status_str = "All Ports In Use"
                             err_msg = "All requested ports are already in use"
@@ -1235,11 +1604,7 @@ class TunnelApp(App):
                             f"[bold red]{err_msg} (Code: {self.ssh_process.returncode})[/bold red]"
                         )
 
-                        # Mark all requested services as blocked if we got All Ports In Use
-                        if (
-                            status_str == "All Ports In Use"
-                            or "address already in use" in stderr_content
-                        ):
+                        if status_str == "All Ports In Use":
                             for srv in self.active_services_to_bind:
                                 self.service_statuses[srv] = "failed_port_in_use"
                             self.update_services_table()
@@ -1247,47 +1612,34 @@ class TunnelApp(App):
                         self.stats.status = status_str
                         self.handle_connection_failure()
 
-                    except asyncio.TimeoutError:
-                        # Connection survived the 6-second timeout.
-                        # Parse stderr to see if any requested ports failed to bind.
-                        listen_port_to_service = {}
-                        for srv in self.active_services_to_bind:
-                            srv_conf = self.config["services"][srv]
-                            srv_type = srv_conf.get("type", "local")
-                            if srv_type == "remote":
-                                listen_port = srv_conf["remote_port"]
-                            else:
-                                listen_port = srv_conf["local_port"]
-                            listen_port_to_service[listen_port] = srv
+                    elif stderr_password_detected:
+                        # SSH printed a prompt on stderr and stayed stalled without askpass completion
+                        self.log_msg(
+                            "[bold red]SSH stalled waiting for a password prompt on stderr.[/bold red]"
+                        )
+                        self.stats.status = "Password Required"
+                        if self.ssh_process:
+                            try:
+                                self.ssh_process.terminate()
+                            except Exception:
+                                pass
+                        self.handle_connection_failure()
 
-                        failed_ports = set()
-                        import re
-
-                        for line in stderr_lines:
-                            if (
-                                "address already in use" in line.lower()
-                                or "cannot listen to port" in line.lower()
-                            ):
-                                digits = re.findall(r"\b\d{2,5}\b", line)
-                                for d in digits:
-                                    p = int(d)
-                                    if p in listen_port_to_service:
-                                        failed_ports.add(p)
+                    else:
+                        # Connection survived the stability window.
+                        failed_set = detect_failed_forward_services(
+                            stderr_lines,
+                            self.active_services_to_bind,
+                            self.config["services"],
+                        )
 
                         # If some ports were already in use
-                        if failed_ports and not self.is_partial_mode:
+                        if failed_set and not self.is_partial_mode:
                             failed_services = []
                             successful_services = []
 
                             for srv_name in self.active_services_to_bind:
-                                srv_conf = self.config["services"][srv_name]
-                                srv_type = srv_conf.get("type", "local")
-                                p = (
-                                    srv_conf["remote_port"]
-                                    if srv_type == "remote"
-                                    else srv_conf["local_port"]
-                                )
-                                if p in failed_ports:
+                                if srv_name in failed_set:
                                     self.service_statuses[srv_name] = (
                                         "failed_port_in_use"
                                     )
@@ -1306,29 +1658,27 @@ class TunnelApp(App):
                                     pass
 
                             if not successful_services:
-                                # All ports were blocked
                                 self.log_msg(
                                     "[bold red]All requested ports are already in use.[/bold red]"
                                 )
                                 self.stats.status = "All Ports In Use"
                                 self.handle_connection_failure()
                             else:
-                                # Succeeded for some, failed for others!
                                 self.log_msg(
                                     f"[bold yellow]Partial connection established. Active: {successful_services}. Blocked: {failed_services}[/bold yellow]"
                                 )
 
-                                # Log the warning lines verbatim
                                 for line in stderr_lines:
+                                    lower_l = line.lower()
                                     if (
-                                        "address already in use" in line.lower()
-                                        or "cannot listen to port" in line.lower()
+                                        "address already in use" in lower_l
+                                        or "cannot listen to port" in lower_l
+                                        or "remote port forwarding failed" in lower_l
                                     ):
                                         self.log_msg(
                                             f"[bold red][PORT WARNING] {line}[/bold red]"
                                         )
 
-                                # Send desktop notification
                                 notify_details = ", ".join(
                                     [
                                         f"{srv} ({self.config['services'][srv]['remote_port'] if self.config['services'][srv].get('type') == 'remote' else self.config['services'][srv]['local_port']})"
@@ -1340,13 +1690,11 @@ class TunnelApp(App):
                                     f"Connected partially. Ports already in use: {notify_details}",
                                 )
 
-                                # Switch to partial mode and continue to restart the connection with only successful ports
                                 self.is_partial_mode = True
                                 self.active_services_to_bind = successful_services
                                 self.stats.status = "DEGRADED"
                                 continue
                         else:
-                            # Succeeded completely for all requested ports
                             for srv_name in self.active_services_to_bind:
                                 self.service_statuses[srv_name] = "active"
                             self.update_services_table()
@@ -1364,7 +1712,6 @@ class TunnelApp(App):
 
                             self.handle_connection_success()
 
-                            # Wait indefinitely for the session to organically drop
                             await self.ssh_process.wait()
 
                             if self.intentional_restart:
@@ -1378,7 +1725,7 @@ class TunnelApp(App):
                                 f"[red]Link dropped unexpectedly (Code: {self.ssh_process.returncode})[/red]"
                             )
                             self.handle_connection_failure()
-                            self.is_partial_mode = False  # Reset on drop
+                            self.is_partial_mode = False
 
                 except Exception as e:
                     self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
@@ -1394,16 +1741,25 @@ class TunnelApp(App):
                     self.stats.status = "Host Unreachable"
 
                 self.log_msg(
-                    "[yellow]Awaiting 5 seconds before attempting reconnect...[/yellow]"
+                    f"[yellow]Awaiting {int(RECONNECT_DELAY_SEC)} seconds before attempting reconnect...[/yellow]"
                 )
 
                 try:
-                    self.sleep_task = asyncio.create_task(asyncio.sleep(5))
+                    self.sleep_task = asyncio.create_task(asyncio.sleep(RECONNECT_DELAY_SEC))
                     await self.sleep_task
                 except asyncio.CancelledError:
                     pass
         finally:
             self.running = False
+            if self._askpass_server is not None:
+                try:
+                    self._askpass_server.close()
+                except Exception:
+                    pass
+                self._askpass_server = None
+            if self._askpass_dir and os.path.exists(self._askpass_dir):
+                shutil.rmtree(self._askpass_dir, ignore_errors=True)
+                self._askpass_dir = None
             if self.ssh_process:
                 try:
                     self.ssh_process.terminate()
