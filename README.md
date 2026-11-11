@@ -37,6 +37,7 @@ When running Aerotunnel, control your operations space with the following global
 | Key | Action | Description |
 |:---:|:---|:---|
 | `h` | **Show Help** | Opens a stunning modal dialog summarizing hotkeys and functions. |
+| `t` | **Target Host (`~/.ssh/config`)** | Opens a table of concrete `Host` entries defined in `~/.ssh/config` to inspect routes and switch target hosts live. |
 | `b` | **Network Bindings** | Open a table-modal to toggle service bindings between local (`127.0.0.1`) and network-wide (`0.0.0.0`) with `Space`. |
 | `l` | **View System Logs** | Opens the raw SSH output and connection lifecycle logs stream. |
 | `s` | **Interactive Shell** | Suspends TUI, opens an active SSH shell session on the host. Exit shell (`exit` or `Ctrl+D`) to return to the TUI. |
@@ -108,13 +109,14 @@ Here is an example config:
 // ▲ AEROTUNNEL CONFIGURATION
 // ============================================================================
 {
-  // The hostname or IP address of your remote server
+  // Hostname, IP address, OR a Host alias defined in ~/.ssh/config (e.g., "ssh.example.com")
+  // Tip: You can also use "ssh_host" instead of "remote_host", and set "ssh_config" to a custom path.
   "remote_host": "ssh.someserver.com",
 
-  // The SSH port of your remote server (default is 22)
+  // Optional SSH port override (omit to inherit Port from ~/.ssh/config; defaults to 22)
   "remote_port": 22,
 
-  // The SSH username for logging into your remote server
+  // Optional SSH username override (omit to inherit User from ~/.ssh/config)
   "remote_user": "ubuntu",
 
   // Services to forward through the secure SSH tunnel
@@ -141,6 +143,28 @@ Here is an example config:
       "service_host": "web.internal.someserver.com",
       "service_port": 80
     }
+  }
+}
+```
+
+### Using `~/.ssh/config` Hosts (e.g., `ProxyCommand` / `cloudflared`)
+
+If your `~/.ssh/config` defines a `Host` alias:
+
+```sshconfig
+Host ssh.example.com
+    ProxyCommand /usr/local/bin/cloudflared access ssh --hostname %h
+    User user1
+    IdentityFile ~/.ssh/your_private_key
+```
+
+Omit `"remote_user"` and `"remote_port"` in `~/.config/aerotunnel/config.json` so OpenSSH inherits `User`, `Port`, `ProxyCommand`, `ProxyJump`, and `IdentityFile` directly from `~/.ssh/config`:
+
+```json
+{
+  "remote_host": "ssh.example.com",
+  "services": {
+    "web": { "local_port": 8080, "service_port": 80 }
   }
 }
 ```
