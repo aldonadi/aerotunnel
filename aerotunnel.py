@@ -1181,10 +1181,12 @@ class TunnelApp(App):
                             if is_stderr:
                                 stderr_lines.append(line_str)
                                 # Check for password prompt
-                                if "password:" in line_str.lower() or "passphrase:" in line_str.lower():
+                                if any(pattern in line_str.lower() for pattern in ("password:", "passphrase:")):
                                     self.log_msg("[bold yellow]SSH is asking for a password. [/bold yellow]")
                                     self.log_msg("[yellow]This may be because no SSH keys are loaded in ssh-agent.[/yellow]")
                                     self.log_msg("[yellow]Please check your SSH agent and keys, or try connecting manually.[/yellow]")
+                                    # Note: In a full implementation, we would present a password modal here
+                                    # But due to complexities of Textual's async model and SSH I/O, we simply log the issue
                             color = "red" if is_stderr else "dim white"
                             self.log_msg(f"[{color}][SSH] {line_str}[/{color}]")
 
