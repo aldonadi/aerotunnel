@@ -2,6 +2,7 @@
 import os
 import re
 import sys
+import glob
 import json
 import stat
 import time
@@ -25,6 +26,7 @@ from rich.table import Table
 from rich.markup import escape
 
 CONFIG_PATH = os.path.expanduser("~/.config/aerotunnel/config.json")
+DEFAULT_SSH_CONFIG_PATH = os.path.expanduser("~/.ssh/config")
 
 # Version Information
 MAJOR = 0
@@ -110,6 +112,377 @@ def detect_failed_forward_services(stderr_lines, active_services, services_confi
                         if conf.get("type", "local") == "remote" and conf.get("remote_port") == port:
                             failed.add(srv)
     return failed
+
+
+def is_proxy_auth_prompt(text: str) -> bool:
+    """Return True if a line indicates ProxyCommand (e.g. cloudflared) is awaiting SSO/browser auth."""
+    lower = text.strip().lower()
+    if not lower:
+        return False
+    return any(
+        phrase in lower
+        for phrase in (
+            "please open the following url",
+            "waiting for login",
+            "waiting for authentication",
+            "authenticate in your browser",
+            "a browser window should have opened",
+        )
+    )
+
+
+def _strip_ssh_comment(line: str) -> str:
+    in_quotes = False
+    for idx, ch in enumerate(line):
+        if ch == '"':
+            in_quotes = not in_quotes
+        elif ch == "#" and not in_quotes:
+            return line[:idx]
+    return line
+
+
+def _iter_ssh_config_lines(filepath: str, visited=None):
+    if visited is None:
+        visited = set()
+    real = os.path.realpath(os.path.expanduser(filepath))
+    if real in visited or not os.path.isfile(real):
+        return
+    visited.add(real)
+    base_dir = os.path.dirname(real)
+    try:
+        with open(real, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return
+
+    for raw in lines:
+        cleaned = _strip_ssh_comment(raw).strip()
+        if not cleaned:
+            continue
+        parts = re.split(r"[\s=]+", cleaned, maxsplit=1)
+        key = parts[0].lower()
+        val = parts[1].strip() if len(parts) > 1 else ""
+        if key == "include" and val:
+            for pattern in shlex.split(val):
+                expanded = os.path.expanduser(pattern)
+                if not os.path.isabs(expanded):
+                    expanded = os.path.join(base_dir, expanded)
+                for match_path in sorted(glob.glob(expanded)):
+                    yield from _iter_ssh_config_lines(match_path, visited)
+        else:
+            yield key, val
+
+
+def list_ssh_config_hosts(ssh_config_path=None):
+    """Parse concrete Host entries from ~/.ssh/config (or a custom SSH config file)."""
+    cfg_path = os.path.expanduser(ssh_config_path) if ssh_config_path else DEFAULT_SSH_CONFIG_PATH
+    if not os.path.isfile(cfg_path):
+        return []
+
+    hosts_by_alias = {}
+    ordered_aliases = []
+    current_aliases = []
+    in_match_block = False
+
+    for key, val in _iter_ssh_config_lines(cfg_path):
+        if key == "host":
+            in_match_block = False
+            try:
+                patterns = shlex.split(val)
+            except ValueError:
+                patterns = val.split()
+            current_aliases = [
+                p
+                for p in patterns
+                if p and not p.startswith("!") and "*" not in p and "?" not in p
+            ]
+            for alias in current_aliases:
+                if alias not in hosts_by_alias:
+                    hosts_by_alias[alias] = {
+                        "host": alias,
+                        "hostname": alias,
+                        "user": "",
+                        "port": 22,
+                        "proxy_command": "",
+                        "proxy_jump": "",
+                        "identity_files": [],
+                    }
+                    ordered_aliases.append(alias)
+        elif key == "match":
+            in_match_block = True
+            current_aliases = []
+        elif not in_match_block and current_aliases:
+            for alias in current_aliases:
+                entry = hosts_by_alias[alias]
+                if key == "hostname" and entry["hostname"] == alias:
+                    entry["hostname"] = val
+                elif key == "user" and not entry["user"]:
+                    entry["user"] = val
+                elif key == "port" and entry["port"] == 22:
+                    try:
+                        entry["port"] = int(val)
+                    except ValueError:
+                        pass
+                elif key == "proxycommand" and not entry["proxy_command"]:
+                    entry["proxy_command"] = val
+                elif key == "proxyjump" and not entry["proxy_jump"]:
+                    entry["proxy_jump"] = val
+                elif key == "identityfile":
+                    entry["identity_files"].append(val)
+
+    return [hosts_by_alias[a] for a in ordered_aliases]
+
+
+def resolve_ssh_target(target_host: str, user=None, port=None, ssh_config_path=None) -> dict:
+    """Resolve effective OpenSSH settings for target_host via `ssh -G`."""
+    effective_cfg = (
+        os.path.expanduser(ssh_config_path) if ssh_config_path else DEFAULT_SSH_CONFIG_PATH
+    )
+    known_hosts = {h["host"] for h in list_ssh_config_hosts(effective_cfg)}
+    matched = target_host in known_hosts
+
+    result = {
+        "target": target_host,
+        "user": user or "",
+        "hostname": target_host,
+        "port": port if port is not None else 22,
+        "proxy_command": "",
+        "proxy_jump": "",
+        "identity_files": [],
+        "matched_ssh_config": matched,
+        "route_summary": "Direct SSH",
+        "error": None,
+        "ssh_config_path": effective_cfg,
+        "explicit_user": bool(user),
+        "explicit_port": port is not None,
+    }
+
+    cmd = ["ssh", "-G"]
+    if os.path.isfile(effective_cfg):
+        cmd.extend(["-F", effective_cfg])
+    elif ssh_config_path:
+        result["error"] = f"SSH config file not found: {effective_cfg}"
+        return result
+    else:
+        cmd.extend(["-F", "/dev/null"])
+
+    if port is not None:
+        cmd.extend(["-p", str(port)])
+    target_spec = f"{user}@{target_host}" if user else target_host
+    cmd.append(target_spec)
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=2.0)
+    except FileNotFoundError:
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    if proc.returncode != 0:
+        err_text = (proc.stderr or proc.stdout or "").strip()
+        result["error"] = err_text or f"ssh -G exited with code {proc.returncode}"
+        return result
+
+    resolved_identities = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) != 2:
+            continue
+        k, v = parts[0].strip().lower(), parts[1].strip()
+        if k == "user" and not result["explicit_user"]:
+            result["user"] = v
+        elif k == "hostname":
+            result["hostname"] = v
+        elif k == "port" and not result["explicit_port"]:
+            try:
+                result["port"] = int(v)
+            except ValueError:
+                pass
+        elif k == "proxycommand" and v.lower() != "none":
+            result["proxy_command"] = v
+        elif k == "proxyjump" and v.lower() != "none":
+            result["proxy_jump"] = v
+        elif k == "identityfile":
+            resolved_identities.append(v)
+
+    result["identity_files"] = resolved_identities
+    if (
+        result["proxy_command"]
+        or result["proxy_jump"]
+        or result["hostname"] != target_host
+        or (not result["explicit_port"] and result["port"] != 22)
+    ):
+        result["matched_ssh_config"] = True
+
+    if result["proxy_command"]:
+        proxy_short = result["proxy_command"]
+        if len(proxy_short) > 42:
+            proxy_short = f"{proxy_short[:39]}..."
+        result["route_summary"] = f"ProxyCommand: {proxy_short}"
+    elif result["proxy_jump"]:
+        result["route_summary"] = f"ProxyJump: {result['proxy_jump']}"
+
+    return result
+
+
+def get_ssh_target(config: dict) -> str:
+    return config.get("remote_host") or config.get("ssh_host") or ""
+
+
+def build_ssh_connection_args(config: dict) -> list[str]:
+    """Build target, port (-p only if set), and -F arguments preserving ~/.ssh/config."""
+    args = []
+    ssh_cfg = config.get("ssh_config")
+    if ssh_cfg:
+        args.extend(["-F", os.path.expanduser(ssh_cfg)])
+    elif DEFAULT_SSH_CONFIG_PATH != os.path.expanduser("~/.ssh/config") and os.path.isfile(DEFAULT_SSH_CONFIG_PATH):
+        args.extend(["-F", DEFAULT_SSH_CONFIG_PATH])
+    if config.get("remote_port") is not None:
+        args.extend(["-p", str(config["remote_port"])])
+    target = get_ssh_target(config)
+    user = config.get("remote_user")
+    args.append(f"{user}@{target}" if user else target)
+    return args
+
+
+def build_ssh_tunnel_command(
+    config: dict,
+    active_services: list[str],
+    service_bindings: dict,
+    include_verbose: bool = True,
+) -> list[str]:
+    """Build the full `ssh` command line for active -L / -R port forwards."""
+    cmd = [
+        "ssh",
+        "-N",
+        "-o",
+        "ServerAliveInterval=10",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+    if include_verbose:
+        cmd.extend(["-o", "LogLevel=VERBOSE"])
+
+    ssh_cfg = config.get("ssh_config")
+    if ssh_cfg:
+        cmd.extend(["-F", os.path.expanduser(ssh_cfg)])
+    elif DEFAULT_SSH_CONFIG_PATH != os.path.expanduser("~/.ssh/config") and os.path.isfile(DEFAULT_SSH_CONFIG_PATH):
+        cmd.extend(["-F", DEFAULT_SSH_CONFIG_PATH])
+
+    if config.get("remote_port") is not None:
+        cmd.extend(["-p", str(config["remote_port"])])
+
+    services = config.get("services", {})
+    for srv_name in active_services:
+        srv_conf = services[srv_name]
+        srv_type = srv_conf.get("type", "local")
+        service_host = format_ssh_host(srv_conf.get("service_host", "127.0.0.1"))
+        service_port = srv_conf["service_port"]
+        bind_ip = format_ssh_host(
+            service_bindings.get(srv_name, srv_conf.get("bind_address", "127.0.0.1"))
+        )
+        if srv_type == "remote":
+            remote_port = srv_conf["remote_port"]
+            cmd.extend(["-R", f"{bind_ip}:{remote_port}:{service_host}:{service_port}"])
+        else:
+            local_port = srv_conf["local_port"]
+            cmd.extend(["-L", f"{bind_ip}:{local_port}:{service_host}:{service_port}"])
+
+    target = get_ssh_target(config)
+    user = config.get("remote_user")
+    cmd.append(f"{user}@{target}" if user else target)
+    return cmd
+
+
+def classify_ssh_failure(stderr_lines, *, stderr_password_detected: bool = False, resolved_ssh=None):
+    """Map SSH stderr output into (status_label, user_error_msg, optional_hint)."""
+    stderr_content = "\n".join(stderr_lines).lower()
+
+    if "bad configuration option" in stderr_content or (
+        "terminating," in stderr_content and "bad configuration" in stderr_content
+    ) or "bad owner or permissions on" in stderr_content:
+        return (
+            "SSH Config Error",
+            "Invalid ~/.ssh/config syntax or file permissions",
+            "Check your ~/.ssh/config syntax and ensure permissions are 600.",
+        )
+
+    if "unprotected private key file" in stderr_content or (
+        "permissions" in stderr_content and "are too open" in stderr_content
+    ):
+        return (
+            "Key Perms Error",
+            "SSH private key permissions too open (run chmod 600 on key)",
+            None,
+        )
+
+    has_proxy = bool(resolved_ssh and (resolved_ssh.get("proxy_command") or resolved_ssh.get("proxy_jump")))
+    if (
+        "proxycommand" in stderr_content
+        or "exec:" in stderr_content
+        or has_proxy
+        or "kex_exchange_identification" in stderr_content
+    ) and (
+        "no such file or directory" in stderr_content
+        or "not found" in stderr_content
+        or "command not found" in stderr_content
+    ):
+        return (
+            "Proxy Cmd Missing",
+            "ProxyCommand executable not found (check ~/.ssh/config)",
+            None,
+        )
+
+    if (
+        "kex_exchange_identification" in stderr_content
+        or "connection closed by unknown port 65535" in stderr_content
+        or ("proxycommand" in stderr_content and "exited with status" in stderr_content)
+    ):
+        return (
+            "Proxy Failed",
+            "ProxyCommand / ProxyJump connection closed before SSH handshake",
+            None,
+        )
+
+    if "permission denied" in stderr_content or stderr_password_detected:
+        return ("Auth Failure", "Permission denied (auth failure)", None)
+
+    if "connection refused" in stderr_content:
+        return ("Conn Refused", "Connection refused by remote host", None)
+
+    if (
+        "no route to host" in stderr_content
+        or "destination host unreachable" in stderr_content
+        or "network is unreachable" in stderr_content
+    ):
+        return ("Host Unreachable", "Host unreachable / No route to host", None)
+
+    if "timed out" in stderr_content:
+        return ("Timed Out", "Connection timed out", None)
+
+    if (
+        "could not resolve hostname" in stderr_content
+        or "name or service not known" in stderr_content
+    ):
+        hint = None
+        if resolved_ssh and not resolved_ssh.get("matched_ssh_config"):
+            target = resolved_ssh.get("target", "")
+            hint = f"Hint: '{target}' did not match any Host block in ~/.ssh/config."
+        return ("DNS Failure", "Could not resolve remote hostname", hint)
+
+    if (
+        "address already in use" in stderr_content
+        or "cannot listen to port" in stderr_content
+        or "remote port forwarding failed" in stderr_content
+    ):
+        return ("All Ports In Use", "All requested ports are already in use", None)
+
+    return ("Host Unreachable", "Connection rejected or unreachable", None)
 
 
 def create_askpass_helper(askpass_dir: str, sock_path: str, token: str) -> str:
@@ -203,29 +576,58 @@ def validate_config(data, logger_cb=print):
     if not isinstance(data, dict):
         raise ConfigValidationError("The root of the configuration file must be a JSON object (dictionary).")
 
-    required_root_keys = {
-        "remote_host": str,
-        "remote_user": str,
-        "services": dict
-    }
+    has_remote_host = "remote_host" in data and data["remote_host"] is not None
+    has_ssh_host = "ssh_host" in data and data["ssh_host"] is not None
+    if not has_remote_host and not has_ssh_host:
+        raise ConfigValidationError("Missing required root-level key: 'remote_host' (or 'ssh_host' for ~/.ssh/config alias).")
 
-    for key, expected_type in required_root_keys.items():
-        if key not in data:
-            raise ConfigValidationError(f"Missing required root-level key: '{key}'")
-        if not isinstance(data[key], expected_type):
-            type_name = expected_type.__name__
-            raise ConfigValidationError(f"The '{key}' setting must be of type {type_name}. Found: {type(data[key]).__name__}")
-        
-        if key != "services":
-            logger_cb(f"[Parsed] {key}: {data[key]}")
+    if has_remote_host:
+        if not isinstance(data["remote_host"], str) or not data["remote_host"].strip():
+            raise ConfigValidationError("The 'remote_host' setting must be a non-empty string.")
+    if has_ssh_host:
+        if not isinstance(data["ssh_host"], str) or not data["ssh_host"].strip():
+            raise ConfigValidationError("The 'ssh_host' setting must be a non-empty string.")
+    if has_remote_host and has_ssh_host and data["remote_host"].strip() != data["ssh_host"].strip():
+        raise ConfigValidationError(
+            "Conflicting host settings: specify either 'remote_host' or 'ssh_host', not both with different values."
+        )
 
-    if "remote_port" not in data:
-        data["remote_port"] = 22
-        logger_cb("[Parsed] remote_port: 22 (default)")
-    else:
+    target_host = (data.get("remote_host") or data.get("ssh_host")).strip()
+    logger_cb(f"[Parsed] target host: {target_host}")
+
+    if "ssh_config" in data and data["ssh_config"] is not None:
+        if not isinstance(data["ssh_config"], str) or not data["ssh_config"].strip():
+            raise ConfigValidationError("The 'ssh_config' setting must be a non-empty file path string.")
+        expanded_ssh_cfg = os.path.expanduser(data["ssh_config"].strip())
+        if not os.path.isfile(expanded_ssh_cfg):
+            raise ConfigValidationError(f"Configured 'ssh_config' file not found: '{expanded_ssh_cfg}'")
+        logger_cb(f"[Parsed] ssh_config: {expanded_ssh_cfg}")
+
+    if "remote_port" in data and data["remote_port"] is not None:
         if not _is_valid_port(data["remote_port"]):
             raise ConfigValidationError("The 'remote_port' setting must be a valid port integer (1-65535).")
-        logger_cb(f"[Parsed] remote_port: {data['remote_port']}")
+        logger_cb(f"[Parsed] remote_port: {data['remote_port']} (explicit override)")
+    else:
+        logger_cb("[Parsed] remote_port: (inherit from ~/.ssh/config or default 22)")
+
+    if "remote_user" in data and data["remote_user"] is not None:
+        if not isinstance(data["remote_user"], str):
+            raise ConfigValidationError(
+                f"The 'remote_user' setting must be of type str. Found: {type(data['remote_user']).__name__}"
+            )
+        if data["remote_user"].strip():
+            logger_cb(f"[Parsed] remote_user: {data['remote_user']} (explicit override)")
+        else:
+            logger_cb("[Parsed] remote_user: (inherit from ~/.ssh/config or current user)")
+    else:
+        logger_cb("[Parsed] remote_user: (inherit from ~/.ssh/config or current user)")
+
+    if "services" not in data:
+        raise ConfigValidationError("Missing required root-level key: 'services'")
+    if not isinstance(data["services"], dict):
+        raise ConfigValidationError(
+            f"The 'services' setting must be of type dict. Found: {type(data['services']).__name__}"
+        )
 
     logger_cb(f"[Parsed] Found {len(data['services'])} service(s) to map in 'services' block.")
 
@@ -280,13 +682,15 @@ def create_boilerplate_config(filepath):
 // Comments (single-line // or #, block /* */) are fully supported!
 // ============================================================================
 {
-  // The hostname or IP address of your remote server (e.g., "ssh.someserver.com" or "192.168.1.100")
+  // SSH destination: a hostname, IP address, OR a Host alias defined in ~/.ssh/config
+  // (e.g., "ssh.example.com" with ProxyCommand/User/IdentityFile, or "192.168.1.100").
+  // Tip: You can also use "ssh_host" instead of "remote_host", and set "ssh_config" to use a custom SSH config path.
   "remote_host": "127.0.0.1",
 
-  // The SSH port of your remote server (default is 22)
+  // Optional SSH port override. Omit or comment out to inherit Port from ~/.ssh/config (defaults to 22).
   "remote_port": 22,
 
-  // The SSH username for logging into your remote server
+  // Optional SSH username override. Omit or comment out to inherit User from ~/.ssh/config.
   "remote_user": "change_me",
 
   // Services to forward through the secure SSH tunnel.
@@ -394,6 +798,10 @@ def check_config_on_startup():
         print(
             "\033[1;33mConfiguration file not found. Creating a boilerplate template...\033[0m"
         )
+        ssh_hosts = list_ssh_config_hosts()
+        if ssh_hosts:
+            names = ", ".join(h["host"] for h in ssh_hosts[:8])
+            print(f"\033[1;36mDetected ~/.ssh/config Host definitions:\033[0m {names}")
         create_boilerplate_config(CONFIG_PATH)
         time.sleep(1.5)
 
@@ -518,6 +926,9 @@ class HelpScreen(ModalScreen):
 • [yellow]Enter / Space[/yellow] : Expand or Collapse Service Row
   [dim]Inspect full tunnel details (type, bind listen address, and target destination host/port) inline.[/dim]
 
+• [yellow]t[/yellow] : Switch Target Host (~/.ssh/config)
+  [dim]Browse concrete Host definitions in ~/.ssh/config (including ProxyCommand / IdentityFile routes) and switch targets live.[/dim]
+
 • [yellow]b[/yellow] : Configure Network Bindings
   [dim]Selectively expose services to your network (0.0.0.0) or restrict them to loopback only (127.0.0.1).[/dim]
 
@@ -615,6 +1026,70 @@ class BindingModal(ModalScreen[dict]):
         self.dismiss(None)
 
 
+# --- SSH CONFIG HOST PICKER MODAL ---
+class SshHostModal(ModalScreen[str]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, hosts, current_host: str = ""):
+        super().__init__()
+        self.hosts = hosts
+        self.current_host = current_host
+
+    def compose(self) -> ComposeResult:
+        if self.hosts:
+            yield Container(
+                Label(
+                    "[bold cyan]Select SSH Host from ~/.ssh/config[/bold cyan]\n"
+                    "[dim]Up/Down to select • Enter to switch target (session) • ESC to cancel[/dim]",
+                    id="dialog_title",
+                ),
+                DataTable(id="ssh_hosts_table"),
+                id="dialog",
+            )
+        else:
+            yield Container(
+                Label(
+                    "[bold cyan]No Concrete Hosts Found in ~/.ssh/config[/bold cyan]\n"
+                    "[dim]Define a `Host <name>` block in ~/.ssh/config or press 'c' to edit config.json.\n"
+                    "Press ESC to close.[/dim]",
+                    id="dialog_title",
+                ),
+                id="dialog",
+            )
+
+    def on_mount(self) -> None:
+        if not self.hosts:
+            return
+        table = self.query_one("#ssh_hosts_table", DataTable)
+        table.cursor_type = "row"
+        table.add_columns("Host Alias", "Resolved Target", "Route")
+        current_idx = 0
+        for idx, entry in enumerate(self.hosts):
+            alias = entry["host"]
+            user = entry.get("user") or ""
+            hostname = entry.get("hostname") or alias
+            port = entry.get("port", 22)
+            target_str = f"{user}@{hostname}:{port}" if user else f"{hostname}:{port}"
+            if entry.get("proxy_command"):
+                route = f"ProxyCommand"
+            elif entry.get("proxy_jump"):
+                route = f"ProxyJump: {entry['proxy_jump']}"
+            else:
+                route = "Direct"
+            label = f"[bold cyan]* {alias}[/]" if alias == self.current_host else alias
+            if alias == self.current_host:
+                current_idx = idx
+            table.add_row(label, target_str, route, key=alias)
+        table.cursor_coordinate = (current_idx, 0)
+        table.focus()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.dismiss(event.row_key.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # --- SSH PASSWORD PROMPT MODAL ---
 class SshPasswordPrompt(ModalScreen[str]):
     BINDINGS = [("escape", "cancel", "Cancel")]
@@ -698,7 +1173,7 @@ class TunnelApp(App):
     #stats_container { border: round magenta; border-title-color: magenta; }
     #services_container { border-title-color: cyan; }
     
-    LogScreen, BindingModal, HelpScreen, SshPasswordPrompt {
+    LogScreen, BindingModal, HelpScreen, SshPasswordPrompt, SshHostModal {
         align: center middle;
         background: $background 80%;
     }
@@ -720,6 +1195,7 @@ class TunnelApp(App):
 
     BINDINGS = [
         ("h", "show_help", "Help"),
+        ("t", "select_ssh_host", "Hosts"),
         ("b", "configure_bindings", "Bindings"),
         ("l", "toggle_log", "Logs"),
         ("s", "open_shell", "Shell"),
@@ -732,6 +1208,7 @@ class TunnelApp(App):
         super().__init__()
         self.stats = TunnelStats()
         self.log_history = []
+        self.resolved_ssh = None
         self.config = self.load_config()
         self.running = True
         self.ssh_process = None
@@ -754,6 +1231,37 @@ class TunnelApp(App):
             for srv, srv_conf in self.config.get("services", {}).items():
                 self.service_bindings[srv] = srv_conf.get("bind_address", "127.0.0.1")
                 self.service_statuses[srv] = "pending"
+            self.refresh_resolved_ssh()
+
+    def refresh_resolved_ssh(self) -> None:
+        if not self.config:
+            self.resolved_ssh = None
+            return
+        target = get_ssh_target(self.config)
+        user = self.config.get("remote_user") or None
+        port = self.config.get("remote_port")
+        ssh_cfg = self.config.get("ssh_config")
+        info = resolve_ssh_target(
+            target, user=user, port=port, ssh_config_path=ssh_cfg
+        )
+        self.resolved_ssh = info
+        if info.get("error"):
+            self.log_msg(f"[bold red]SSH Config Resolution Error:[/bold red] {info['error']}")
+        elif info.get("matched_ssh_config"):
+            self.log_msg(
+                f"[cyan]Resolved SSH Host '{target}' via {info['ssh_config_path']}:[/cyan] "
+                f"{info['user']}@{info['hostname']}:{info['port']} ({info['route_summary']})"
+            )
+            if info.get("explicit_user") or info.get("explicit_port"):
+                base_info = resolve_ssh_target(target, ssh_config_path=ssh_cfg)
+                if info.get("explicit_user") and base_info.get("user") and base_info["user"] != info["user"]:
+                    self.log_msg(
+                        f"[dim]Note: config.json 'remote_user' ('{info['user']}') overrides ~/.ssh/config User ('{base_info['user']}').[/dim]"
+                    )
+                if info.get("explicit_port") and base_info.get("port") and base_info["port"] != info["port"]:
+                    self.log_msg(
+                        f"[dim]Note: config.json 'remote_port' ({info['port']}) overrides ~/.ssh/config Port ({base_info['port']}).[/dim]"
+                    )
 
     def load_config(self):
         self.log_msg(f"[bold cyan]Trying to read config file '{CONFIG_PATH}'...[/bold cyan]")
@@ -1065,10 +1573,7 @@ class TunnelApp(App):
                 "ssh",
                 "-o",
                 "StrictHostKeyChecking=accept-new",
-                "-p",
-                str(self.config.get("remote_port", 22)),
-                f"{self.config['remote_user']}@{self.config['remote_host']}",
-            ]
+            ] + build_ssh_connection_args(self.config)
 
             try:
                 subprocess.run(cmd)
@@ -1100,6 +1605,7 @@ class TunnelApp(App):
         if new_config:
             self.config = new_config
             self.is_partial_mode = False
+            self.refresh_resolved_ssh()
 
             # Re-initialize and update service bindings & statuses
             new_bindings = {}
@@ -1121,6 +1627,7 @@ class TunnelApp(App):
             }
 
             self.update_services_table()
+            self.update_ui()
             self.log_msg(
                 "[yellow]Configuration reloaded. Restarting SSH tunnel...[/yellow]"
             )
@@ -1129,6 +1636,27 @@ class TunnelApp(App):
             self.log_msg(
                 "[bold red]Failed to apply reloaded config due to parsing errors. Retaining previous stable config.[/bold red]"
             )
+
+    @work
+    async def action_select_ssh_host(self) -> None:
+        ssh_cfg = self.config.get("ssh_config") if self.config else None
+        hosts = list_ssh_config_hosts(ssh_cfg)
+        current = get_ssh_target(self.config) if self.config else ""
+        selected = await self.push_screen_wait(SshHostModal(hosts, current_host=current))
+        if selected:
+            if not self.config:
+                self.log_msg("[red]Cannot switch host: No valid config loaded.[/red]")
+                return
+            self.config["remote_host"] = selected
+            self.config.pop("ssh_host", None)
+            self.config.pop("remote_user", None)
+            self.config.pop("remote_port", None)
+            self.refresh_resolved_ssh()
+            self.update_ui()
+            self.log_msg(
+                f"[yellow]Switched active SSH Host to '{selected}' for this session (edit config with 'c' to persist).[/yellow]"
+            )
+            self.restart_tunnel()
 
     @work
     async def action_configure_bindings(self) -> None:
@@ -1222,11 +1750,36 @@ class TunnelApp(App):
 
         remote_host = "N/A"
         remote_port = "N/A"
+        extra_route_rows = []
         if self.config:
-            remote_host = f"[bold cyan]{self.config.get('remote_user', '')}@{self.config.get('remote_host', '')}[/]"
-            remote_port = f"[bold cyan]{self.config.get('remote_port', 22)}[/]"
+            target = get_ssh_target(self.config)
+            res = self.resolved_ssh or {}
+            eff_user = self.config.get("remote_user") or res.get("user") or ""
+            eff_port = (
+                self.config.get("remote_port")
+                if self.config.get("remote_port") is not None
+                else res.get("port", 22)
+            )
+            host_label = f"{eff_user}@{target}" if eff_user else target
+            if res.get("matched_ssh_config"):
+                remote_host = f"[bold cyan]{escape(host_label)}[/] [dim green](ssh_config)[/]"
+            else:
+                remote_host = f"[bold cyan]{escape(host_label)}[/]"
+            remote_port = f"[bold cyan]{eff_port}[/]"
+            eff_hostname = res.get("hostname", target)
+            if eff_hostname and eff_hostname != target:
+                extra_route_rows.append(("Resolved Host:", f"[cyan]{escape(eff_hostname)}[/]"))
+            if res.get("proxy_command") or res.get("proxy_jump"):
+                extra_route_rows.append(("SSH Route:", f"[cyan]{escape(res.get('route_summary', ''))}[/]"))
 
         table.add_row("Remote Host:", remote_host, "SSH Port:", remote_port)
+        for idx in range(0, len(extra_route_rows), 2):
+            left_k, left_v = extra_route_rows[idx]
+            if idx + 1 < len(extra_route_rows):
+                right_k, right_v = extra_route_rows[idx + 1]
+            else:
+                right_k, right_v = "", ""
+            table.add_row(left_k, left_v, right_k, right_v)
         table.add_row(
             "Engine Runtime:",
             fmt_time(app_runtime),
@@ -1338,6 +1891,7 @@ class TunnelApp(App):
 
                     if password is None:
                         self._auth_cancelled = True
+                        self.stats.status = "Auth Cancelled"
                         writer.write(b'{"cancel": true}\n')
                         await writer.drain()
                         if self.ssh_process and self.ssh_process.returncode is None:
@@ -1397,51 +1951,22 @@ class TunnelApp(App):
 
                 self.stats.attempts += 1
 
-                cmd = [
-                    "ssh",
-                    "-N",
-                    "-o",
-                    "ServerAliveInterval=10",
-                    "-o",
-                    "ServerAliveCountMax=2",
-                    "-o",
-                    "ConnectTimeout=5",
-                    "-o",
-                    "StrictHostKeyChecking=accept-new",
-                    "-p",
-                    str(self.config.get("remote_port", 22)),
-                ]
-
-                for srv_name in self.active_services_to_bind:
-                    srv_conf = self.config["services"][srv_name]
-                    srv_type = srv_conf.get("type", "local")
-                    service_host = format_ssh_host(srv_conf.get("service_host", "127.0.0.1"))
-                    service_port = srv_conf["service_port"]
-                    bind_ip = format_ssh_host(
-                        self.service_bindings.get(
-                            srv_name, srv_conf.get("bind_address", "127.0.0.1")
-                        )
-                    )
-
-                    if srv_type == "remote":
-                        remote_port = srv_conf["remote_port"]
-                        cmd.extend(
-                            [
-                                "-R",
-                                f"{bind_ip}:{remote_port}:{service_host}:{service_port}",
-                            ]
-                        )
-                    else:
-                        local_port = srv_conf["local_port"]
-                        cmd.extend(
-                            [
-                                "-L",
-                                f"{bind_ip}:{local_port}:{service_host}:{service_port}",
-                            ]
-                        )
-
-                cmd.append(f"{self.config['remote_user']}@{self.config['remote_host']}")
+                cmd = build_ssh_tunnel_command(
+                    self.config,
+                    self.active_services_to_bind,
+                    self.service_bindings,
+                )
                 self.log_msg(f"[yellow]Spawning Subprocess:[/yellow] {' '.join(cmd)}")
+
+                if self.resolved_ssh and self.resolved_ssh.get("proxy_command"):
+                    try:
+                        proxy_parts = shlex.split(self.resolved_ssh["proxy_command"])
+                        if proxy_parts and not shutil.which(proxy_parts[0]) and not os.path.exists(proxy_parts[0]):
+                            self.log_msg(
+                                f"[bold yellow]Warning: ProxyCommand binary '{proxy_parts[0]}' not found on PATH.[/bold yellow]"
+                            )
+                    except ValueError:
+                        pass
 
                 env = os.environ.copy()
                 if askpass_script:
@@ -1450,6 +1975,7 @@ class TunnelApp(App):
                     if not env.get("DISPLAY"):
                         env["DISPLAY"] = ":0"
 
+                stream_tasks = []
                 try:
                     self.ssh_process = await asyncio.create_subprocess_exec(
                         *cmd,
@@ -1462,12 +1988,22 @@ class TunnelApp(App):
 
                     stderr_lines = []
                     stderr_password_detected = False
+                    proxy_auth_pending = False
 
                     def handle_stream_line(line_str: str, is_stderr: bool):
-                        nonlocal stderr_password_detected
+                        nonlocal stderr_password_detected, proxy_auth_pending
                         if is_stderr:
                             stderr_lines.append(line_str)
-                            if is_ssh_password_prompt(line_str):
+                            lower_line = line_str.lower()
+                            if lower_line.startswith("authenticated to "):
+                                proxy_auth_pending = False
+                            elif is_proxy_auth_prompt(line_str):
+                                proxy_auth_pending = True
+                                self.stats.status = "Proxy Auth"
+                                self.log_msg(
+                                    "[bold yellow]ProxyCommand waiting for external/browser authentication.[/bold yellow]"
+                                )
+                            elif is_ssh_password_prompt(line_str):
                                 stderr_password_detected = True
                                 self.stats.status = "Password Required"
                                 self.log_msg("[bold yellow]SSH is asking for a password.[/bold yellow]")
@@ -1508,7 +2044,7 @@ class TunnelApp(App):
                                 is_stderr
                                 and partial
                                 and partial != last_partial_logged
-                                and is_ssh_password_prompt(partial)
+                                and (is_ssh_password_prompt(partial) or is_proxy_auth_prompt(partial))
                             ):
                                 handle_stream_line(partial, is_stderr=True)
                                 last_partial_logged = partial
@@ -1518,15 +2054,15 @@ class TunnelApp(App):
                         asyncio.create_task(read_stream(self.ssh_process.stderr, True)),
                     ]
 
-                    # Wait STABILITY_WAIT_SEC excluding time spent inside interactive password prompts
+                    # Wait STABILITY_WAIT_SEC excluding time spent in interactive password/proxy auth prompts
                     stable_elapsed = 0.0
-                    exited_early = False
+                    exited_early = self.ssh_process.returncode is not None
                     last_tick = time.monotonic()
-                    while self.ssh_process.returncode is None:
+                    while not exited_early:
                         now = time.monotonic()
                         dt = now - last_tick
                         last_tick = now
-                        if self._auth_prompt_active:
+                        if self._auth_prompt_active or proxy_auth_pending:
                             stable_elapsed = 0.0
                         else:
                             stable_elapsed += dt
@@ -1537,16 +2073,19 @@ class TunnelApp(App):
                             exited_early = True
                             break
                         except asyncio.TimeoutError:
-                            pass
+                            if self.ssh_process.returncode is not None:
+                                exited_early = True
+                                break
 
                     if exited_early:
-                        try:
-                            await asyncio.wait_for(
-                                asyncio.gather(*stream_tasks, return_exceptions=True),
-                                timeout=0.2,
-                            )
-                        except asyncio.TimeoutError:
-                            pass
+                        if not self.intentional_restart and not self._auth_cancelled:
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.gather(*stream_tasks, return_exceptions=True),
+                                    timeout=0.2,
+                                )
+                            except asyncio.TimeoutError:
+                                pass
 
                         if self.intentional_restart:
                             self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
@@ -1566,43 +2105,17 @@ class TunnelApp(App):
                             continue
 
                         # Connection failed before stability window completed
-                        err_msg = "Connection rejected or unreachable"
-                        status_str = "Host Unreachable"
-
-                        stderr_content = "\n".join(stderr_lines).lower()
-                        if "permission denied" in stderr_content or stderr_password_detected:
-                            status_str = "Auth Failure"
-                            err_msg = "Permission denied (auth failure)"
-                        elif "connection refused" in stderr_content:
-                            status_str = "Conn Refused"
-                            err_msg = "Connection refused by remote host"
-                        elif (
-                            "no route to host" in stderr_content
-                            or "destination host unreachable" in stderr_content
-                            or "network is unreachable" in stderr_content
-                        ):
-                            status_str = "Host Unreachable"
-                            err_msg = "Host unreachable / No route to host"
-                        elif "timed out" in stderr_content:
-                            status_str = "Timed Out"
-                            err_msg = "Connection timed out"
-                        elif (
-                            "could not resolve hostname" in stderr_content
-                            or "name or service not known" in stderr_content
-                        ):
-                            status_str = "DNS Failure"
-                            err_msg = "Could not resolve remote hostname"
-                        elif (
-                            "address already in use" in stderr_content
-                            or "cannot listen to port" in stderr_content
-                            or "remote port forwarding failed" in stderr_content
-                        ):
-                            status_str = "All Ports In Use"
-                            err_msg = "All requested ports are already in use"
+                        status_str, err_msg, hint = classify_ssh_failure(
+                            stderr_lines,
+                            stderr_password_detected=stderr_password_detected,
+                            resolved_ssh=self.resolved_ssh,
+                        )
 
                         self.log_msg(
                             f"[bold red]{err_msg} (Code: {self.ssh_process.returncode})[/bold red]"
                         )
+                        if hint:
+                            self.log_msg(f"[yellow]{hint}[/yellow]")
 
                         if status_str == "All Ports In Use":
                             for srv in self.active_services_to_bind:
@@ -1731,6 +2244,12 @@ class TunnelApp(App):
                     self.log_msg(f"[bold red]System Exception:[/bold red] {str(e)}")
                     self.handle_connection_failure()
                     self.is_partial_mode = False
+                finally:
+                    for t in stream_tasks:
+                        if not t.done():
+                            t.cancel()
+                    if stream_tasks:
+                        await asyncio.gather(*stream_tasks, return_exceptions=True)
 
                 if self.is_partial_mode:
                     self.stats.status = "DEGRADED"

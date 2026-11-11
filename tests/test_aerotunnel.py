@@ -50,7 +50,13 @@ class TestConfigParsingAndValidation(unittest.TestCase):
             },
         }
         aerotunnel.validate_config(data, logger_cb=lambda _: None)
-        self.assertEqual(data.get("remote_port"), 22)
+        resolved = aerotunnel.resolve_ssh_target(
+            "ssh.someserver.com",
+            user=data.get("remote_user"),
+            port=data.get("remote_port"),
+            ssh_config_path="/dev/null",
+        )
+        self.assertEqual(resolved["port"], 22)
 
     def test_rejects_boolean_and_invalid_ports(self):
         for bad_port in (True, False, 0, -1, 70000):
@@ -379,8 +385,8 @@ class TestSshLoopAndAskpass(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause(0.4)
                 self.assertTrue(spawn_calls)
                 cmd, kwargs = spawn_calls[0]
-                # remote_port defaulted to 22
-                self.assertEqual(cmd[cmd.index("-p") + 1], "22")
+                # Omitted remote_port does not force -p 22 so ~/.ssh/config Port can apply
+                self.assertNotIn("-p", cmd)
                 # detached session + SSH_ASKPASS configured
                 self.assertTrue(kwargs.get("start_new_session"))
                 env = kwargs.get("env", {})
@@ -551,7 +557,7 @@ class TestSshLoopAndAskpass(unittest.IsolatedAsyncioTestCase):
             return await orig_exec(*cmd, **kwargs)
 
         with patch.object(aerotunnel, "CONFIG_PATH", self.cfg_path), \
-             patch.object(aerotunnel, "STABILITY_WAIT_SEC", 0.2), \
+             patch.object(aerotunnel, "STABILITY_WAIT_SEC", 0.5), \
              patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
             app = aerotunnel.TunnelApp()
             async with app.run_test(size=(120, 35)) as pilot:
@@ -564,20 +570,20 @@ class TestSshLoopAndAskpass(unittest.IsolatedAsyncioTestCase):
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
                 )
-                for _ in range(20):
+                for _ in range(30):
                     await pilot.pause(0.05)
                     if isinstance(app.screen, aerotunnel.SshPasswordPrompt):
                         break
                 self.assertIsInstance(app.screen, aerotunnel.SshPasswordPrompt)
-                # Hold modal open longer than STABILITY_WAIT_SEC (0.2s)
-                await pilot.pause(0.35)
+                # Hold modal open longer than STABILITY_WAIT_SEC (0.5s)
+                await pilot.pause(0.6)
                 self.assertEqual(app.stats.status, "Password Required")
                 self.assertNotEqual(app.service_statuses["local_svc"], "active")
 
                 # Submit password -> stability clock starts after prompt closes
                 await pilot.press(*list("pw"), "enter")
                 await asyncio.wait_for(helper_proc.communicate(), timeout=2.0)
-                await pilot.pause(0.35)
+                await pilot.pause(0.65)
                 self.assertEqual(app.stats.status, "CONNECTED")
                 self.assertEqual(app.service_statuses["local_svc"], "active")
 
@@ -663,6 +669,285 @@ class TestSshLoopAndAskpass(unittest.IsolatedAsyncioTestCase):
                     os.kill(agent_pid, 15)
                 except OSError:
                     pass
+
+
+class TestSshConfigSupport(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ssh_cfg = os.path.join(self.tmp.name, "ssh_config")
+        with open(self.ssh_cfg, "w") as f:
+            f.write(
+                "Host ssh.example.com\n"
+                "    ProxyCommand /usr/local/bin/cloudflared access ssh --hostname %h\n"
+                "    User user1\n"
+                "    Port 2222\n"
+                "    IdentityFile ~/.ssh/your_private_key\n\n"
+                "Host bastion prod-api\n"
+                "    HostName 10.20.30.40\n"
+                "    User ops\n\n"
+                "Host *.internal !bastion\n"
+                "    User wilduser\n\n"
+                "Host *\n"
+                "    ServerAliveInterval 30\n"
+            )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_config_allows_ssh_config_host_without_remote_user_or_port(self):
+        data = {
+            "remote_host": "ssh.example.com",
+            "ssh_config": self.ssh_cfg,
+            "services": {"ollama": {"local_port": 11434, "service_port": 11434}},
+        }
+        aerotunnel.validate_config(data, logger_cb=lambda _: None)
+
+    def test_config_supports_ssh_host_and_rejects_conflicts_and_missing_file(self):
+        data_alias = {
+            "ssh_host": "ssh.example.com",
+            "ssh_config": self.ssh_cfg,
+            "services": {"ollama": {"local_port": 11434, "service_port": 11434}},
+        }
+        aerotunnel.validate_config(data_alias, logger_cb=lambda _: None)
+
+        conflict = {
+            "remote_host": "a.example.com",
+            "ssh_host": "b.example.com",
+            "services": {"ollama": {"local_port": 11434, "service_port": 11434}},
+        }
+        with self.assertRaises(aerotunnel.ConfigValidationError):
+            aerotunnel.validate_config(conflict, logger_cb=lambda _: None)
+
+        missing_cfg = {
+            "remote_host": "ssh.example.com",
+            "ssh_config": os.path.join(self.tmp.name, "missing_ssh_config"),
+            "services": {"ollama": {"local_port": 11434, "service_port": 11434}},
+        }
+        with self.assertRaises(aerotunnel.ConfigValidationError):
+            aerotunnel.validate_config(missing_cfg, logger_cb=lambda _: None)
+
+    def test_resolve_ssh_target_reads_proxycommand_user_port_identity_and_errors(self):
+        info = aerotunnel.resolve_ssh_target("ssh.example.com", ssh_config_path=self.ssh_cfg)
+        self.assertTrue(info["matched_ssh_config"])
+        self.assertEqual(info["user"], "user1")
+        self.assertEqual(info["port"], 2222)
+        self.assertEqual(info["hostname"], "ssh.example.com")
+        self.assertIn("cloudflared", info["proxy_command"])
+        self.assertTrue(any("your_private_key" in p for p in info["identity_files"]))
+
+        bad_cfg = os.path.join(self.tmp.name, "bad_ssh_config")
+        with open(bad_cfg, "w") as f:
+            f.write("Host broken\n    BadDirectiveName 123\n")
+        bad_info = aerotunnel.resolve_ssh_target("broken", ssh_config_path=bad_cfg)
+        self.assertTrue(bad_info["error"])
+        self.assertIn("baddirectivename", bad_info["error"].lower())
+
+    def test_list_ssh_config_hosts_parses_concrete_entries_only(self):
+        hosts = aerotunnel.list_ssh_config_hosts(self.ssh_cfg)
+        aliases = [h["host"] for h in hosts]
+        self.assertEqual(aliases, ["ssh.example.com", "bastion", "prod-api"])
+        by_alias = {h["host"]: h for h in hosts}
+        self.assertEqual(by_alias["bastion"]["hostname"], "10.20.30.40")
+        self.assertEqual(by_alias["ssh.example.com"]["user"], "user1")
+
+    def test_build_ssh_command_preserves_ssh_config_unless_overridden(self):
+        cfg = {
+            "ssh_host": "ssh.example.com",
+            "ssh_config": self.ssh_cfg,
+            "services": {"web": {"local_port": 8080, "service_port": 80}},
+        }
+        cmd_inherit = aerotunnel.build_ssh_tunnel_command(
+            cfg, ["web"], {"web": "127.0.0.1"}
+        )
+        self.assertIn("-F", cmd_inherit)
+        self.assertEqual(cmd_inherit[cmd_inherit.index("-F") + 1], self.ssh_cfg)
+        self.assertNotIn("-p", cmd_inherit)
+        self.assertEqual(cmd_inherit[-1], "ssh.example.com")
+
+        cfg_override = {
+            "remote_host": "ssh.example.com",
+            "remote_user": "alice",
+            "remote_port": 2200,
+            "ssh_config": self.ssh_cfg,
+            "services": {"web": {"local_port": 8080, "service_port": 80}},
+        }
+        cmd_override = aerotunnel.build_ssh_tunnel_command(
+            cfg_override, ["web"], {"web": "127.0.0.1"}
+        )
+        self.assertEqual(cmd_override[cmd_override.index("-p") + 1], "2200")
+        self.assertEqual(cmd_override[-1], "alice@ssh.example.com")
+
+    def test_classify_ssh_failure_handles_ssh_config_proxy_and_key_errors(self):
+        self.assertEqual(
+            aerotunnel.classify_ssh_failure(["/home/u/.ssh/config: line 4: Bad configuration option: foo"])[0],
+            "SSH Config Error",
+        )
+        self.assertEqual(
+            aerotunnel.classify_ssh_failure(["exec: /usr/local/bin/cloudflared: No such file or directory"])[0],
+            "Proxy Cmd Missing",
+        )
+        self.assertEqual(
+            aerotunnel.classify_ssh_failure([
+                "kex_exchange_identification: Connection closed by remote host",
+                "Connection closed by UNKNOWN port 65535",
+            ])[0],
+            "Proxy Failed",
+        )
+        self.assertEqual(
+            aerotunnel.classify_ssh_failure(["WARNING: UNPROTECTED PRIVATE KEY FILE!"])[0],
+            "Key Perms Error",
+        )
+
+
+class TestSshConfigTuiAndProxyLoop(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ssh_cfg = os.path.join(self.tmp.name, "ssh_config")
+        with open(self.ssh_cfg, "w") as f:
+            f.write(
+                "Host ssh.example.com\n"
+                "    ProxyCommand /bin/sh -c 'exit 1'\n"
+                "    User user1\n"
+                "    Port 2222\n"
+                "    IdentityFile ~/.ssh/your_private_key\n\n"
+                "Host gpu-box\n"
+                "    HostName 10.10.0.5\n"
+                "    User ml\n"
+                "    Port 2202\n"
+            )
+        self.cfg_path = os.path.join(self.tmp.name, "config.json")
+        with open(self.cfg_path, "w") as f:
+            json.dump(
+                {
+                    "remote_host": "ssh.example.com",
+                    "ssh_config": self.ssh_cfg,
+                    "services": {
+                        "ollama": {"local_port": 11434, "service_port": 11434},
+                        "rev": {"type": "remote", "remote_port": 9000, "service_port": 9000},
+                    },
+                },
+                f,
+            )
+
+    async def asyncTearDown(self):
+        self.tmp.cleanup()
+
+    async def test_stats_display_and_host_picker_modal(self):
+        @aerotunnel.work
+        async def noop_loop(self):
+            return
+
+        with patch.object(aerotunnel, "CONFIG_PATH", self.cfg_path), \
+             patch.object(aerotunnel, "DEFAULT_SSH_CONFIG_PATH", self.ssh_cfg), \
+             patch.object(aerotunnel.TunnelApp, "run_ssh_loop", noop_loop):
+            app = aerotunnel.TunnelApp()
+            async with app.run_test(size=(130, 35)) as pilot:
+                await pilot.pause(0.1)
+                self.assertEqual(app.resolved_ssh["user"], "user1")
+                self.assertEqual(app.resolved_ssh["port"], 2222)
+                self.assertIn("ProxyCommand", app.resolved_ssh["route_summary"])
+
+                # Render stats and ensure no leading '@ssh.example.com' bug
+                from rich.console import Console
+                con = Console(width=80, record=True)
+                con.print(app.query_one("#stats_text", aerotunnel.Static).content)
+                stats_text = con.export_text()
+                self.assertIn("user1@ssh.example.com", stats_text)
+                self.assertIn("2222", stats_text)
+                self.assertNotIn("@ssh.example.com", stats_text.replace("user1@ssh.example.com", ""))
+
+                # Press 't' to open SshHostModal, arrow down to 'gpu-box', press Enter
+                await pilot.press("t")
+                await pilot.pause(0.1)
+                self.assertIsInstance(app.screen, aerotunnel.SshHostModal)
+                await pilot.press("down", "enter")
+                await pilot.pause(0.1)
+                self.assertEqual(app.config["remote_host"], "gpu-box")
+                self.assertEqual(app.resolved_ssh["user"], "ml")
+                self.assertEqual(app.resolved_ssh["port"], 2202)
+                self.assertEqual(app.resolved_ssh["hostname"], "10.10.0.5")
+
+    async def test_proxy_auth_url_pauses_connected_until_authenticated(self):
+        class ProxyStream:
+            def __init__(self, steps):
+                self.steps = list(steps)
+            async def read(self, n=-1):
+                if self.steps:
+                    delay, data = self.steps.pop(0)
+                    await asyncio.sleep(delay)
+                    return data
+                await asyncio.sleep(10)
+                return b""
+
+        class EmptyStream:
+            async def read(self, n=-1):
+                await asyncio.sleep(10)
+                return b""
+
+        class ProxyProc:
+            returncode = None
+            def __init__(self):
+                self.stdout = EmptyStream()
+                self.stderr = ProxyStream([
+                    (0.02, b"Please open the following URL and log in with your Cloudflare Access account:\n"),
+                    (0.02, b"https://example.cloudflareaccess.com/cdn-cgi/access/cli?edge_token=abc\n"),
+                    (0.35, b"Authenticated to ssh.example.com (via proxy) using \"publickey\".\n"),
+                ])
+                self._done = asyncio.Event()
+            async def wait(self):
+                await self._done.wait()
+                return 0
+            def terminate(self):
+                self.returncode = -15
+                self._done.set()
+
+        async def fake_exec(*cmd, **kwargs):
+            return ProxyProc()
+
+        with patch.object(aerotunnel, "CONFIG_PATH", self.cfg_path), \
+             patch.object(aerotunnel, "STABILITY_WAIT_SEC", 0.2), \
+             patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+            app = aerotunnel.TunnelApp()
+            async with app.run_test(size=(120, 35)) as pilot:
+                # At t=0.28s (> STABILITY_WAIT_SEC 0.2s), proxy auth is still waiting -> NOT CONNECTED!
+                await pilot.pause(0.28)
+                self.assertEqual(app.stats.status, "Proxy Auth")
+                self.assertNotEqual(app.service_statuses["ollama"], "active")
+
+                # Once Authenticated line arrives + stability window elapses -> CONNECTED!
+                await pilot.pause(0.45)
+                self.assertEqual(app.stats.status, "CONNECTED")
+                self.assertEqual(app.service_statuses["ollama"], "active")
+                self.assertEqual(app.service_statuses["rev"], "active")
+
+    async def test_real_openssh_fails_cleanly_on_missing_proxycommand_executable(self):
+        bad_proxy_ssh = os.path.join(self.tmp.name, "bad_proxy_ssh")
+        missing_bin = os.path.join(self.tmp.name, "no_such_cloudflared")
+        with open(bad_proxy_ssh, "w") as f:
+            f.write(
+                "Host ssh.example.com\n"
+                f"    ProxyCommand {missing_bin} access ssh --hostname %h\n"
+                "    User user1\n"
+            )
+        with open(self.cfg_path, "w") as f:
+            json.dump(
+                {
+                    "remote_host": "ssh.example.com",
+                    "ssh_config": bad_proxy_ssh,
+                    "services": {"ollama": {"local_port": 11434, "service_port": 11434}},
+                },
+                f,
+            )
+
+        with patch.object(aerotunnel, "CONFIG_PATH", self.cfg_path), \
+             patch.object(aerotunnel, "RECONNECT_DELAY_SEC", 5.0):
+            app = aerotunnel.TunnelApp()
+            async with app.run_test(size=(120, 35)) as pilot:
+                for _ in range(30):
+                    await pilot.pause(0.05)
+                    if app.stats.status == "Proxy Cmd Missing":
+                        break
+                self.assertEqual(app.stats.status, "Proxy Cmd Missing")
 
 
 if __name__ == "__main__":
