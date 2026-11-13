@@ -18,7 +18,16 @@ from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.containers import Container
-from textual.widgets import Header, Footer, Static, DataTable, RichLog, Label, Input, Button
+from textual.widgets import (
+    Header,
+    Footer,
+    Static,
+    DataTable,
+    RichLog,
+    Label,
+    Input,
+    Button,
+)
 from textual.screen import ModalScreen
 from textual import work, events
 
@@ -31,9 +40,9 @@ DEFAULT_SSH_CONFIG_PATH = os.path.expanduser("~/.ssh/config")
 # Version Information
 MAJOR = 0
 MINOR = 2
-PATCH = 4
+PATCH = 5
 VERSION = f"{MAJOR}.{MINOR}.{PATCH}"
-DATE_RELEASED = "2026-06-23"
+DATE_RELEASED = "2026-11-11"
 
 # Timing & Notification Constants
 STABILITY_WAIT_SEC = 6.0
@@ -44,6 +53,7 @@ MOBILE_SCREEN_MAX_WIDTH = 79
 
 class ConfigValidationError(Exception):
     """Custom exception for configuration parsing and validation errors."""
+
     pass
 
 
@@ -94,7 +104,10 @@ def detect_failed_forward_services(stderr_lines, active_services, services_confi
                 port = int(m.group(1))
                 for srv in active_services:
                     conf = services_config[srv]
-                    if conf.get("type", "local") == "remote" and conf.get("remote_port") == port:
+                    if (
+                        conf.get("type", "local") == "remote"
+                        and conf.get("remote_port") == port
+                    ):
                         failed.add(srv)
         elif "address already in use" in lower or "cannot listen to port" in lower:
             m = re.search(r"(?:\]:|port:\s*)(\d+)\b", line, re.IGNORECASE)
@@ -103,13 +116,19 @@ def detect_failed_forward_services(stderr_lines, active_services, services_confi
                 matched_local = False
                 for srv in active_services:
                     conf = services_config[srv]
-                    if conf.get("type", "local") == "local" and conf.get("local_port") == port:
+                    if (
+                        conf.get("type", "local") == "local"
+                        and conf.get("local_port") == port
+                    ):
                         failed.add(srv)
                         matched_local = True
                 if not matched_local:
                     for srv in active_services:
                         conf = services_config[srv]
-                        if conf.get("type", "local") == "remote" and conf.get("remote_port") == port:
+                        if (
+                            conf.get("type", "local") == "remote"
+                            and conf.get("remote_port") == port
+                        ):
                             failed.add(srv)
     return failed
 
@@ -175,7 +194,11 @@ def _iter_ssh_config_lines(filepath: str, visited=None):
 
 def list_ssh_config_hosts(ssh_config_path=None):
     """Parse concrete Host entries from ~/.ssh/config (or a custom SSH config file)."""
-    cfg_path = os.path.expanduser(ssh_config_path) if ssh_config_path else DEFAULT_SSH_CONFIG_PATH
+    cfg_path = (
+        os.path.expanduser(ssh_config_path)
+        if ssh_config_path
+        else DEFAULT_SSH_CONFIG_PATH
+    )
     if not os.path.isfile(cfg_path):
         return []
 
@@ -233,10 +256,14 @@ def list_ssh_config_hosts(ssh_config_path=None):
     return [hosts_by_alias[a] for a in ordered_aliases]
 
 
-def resolve_ssh_target(target_host: str, user=None, port=None, ssh_config_path=None) -> dict:
+def resolve_ssh_target(
+    target_host: str, user=None, port=None, ssh_config_path=None
+) -> dict:
     """Resolve effective OpenSSH settings for target_host via `ssh -G`."""
     effective_cfg = (
-        os.path.expanduser(ssh_config_path) if ssh_config_path else DEFAULT_SSH_CONFIG_PATH
+        os.path.expanduser(ssh_config_path)
+        if ssh_config_path
+        else DEFAULT_SSH_CONFIG_PATH
     )
     known_hosts = {h["host"] for h in list_ssh_config_hosts(effective_cfg)}
     matched = target_host in known_hosts
@@ -336,7 +363,9 @@ def build_ssh_connection_args(config: dict) -> list[str]:
     ssh_cfg = config.get("ssh_config")
     if ssh_cfg:
         args.extend(["-F", os.path.expanduser(ssh_cfg)])
-    elif DEFAULT_SSH_CONFIG_PATH != os.path.expanduser("~/.ssh/config") and os.path.isfile(DEFAULT_SSH_CONFIG_PATH):
+    elif DEFAULT_SSH_CONFIG_PATH != os.path.expanduser(
+        "~/.ssh/config"
+    ) and os.path.isfile(DEFAULT_SSH_CONFIG_PATH):
         args.extend(["-F", DEFAULT_SSH_CONFIG_PATH])
     if config.get("remote_port") is not None:
         args.extend(["-p", str(config["remote_port"])])
@@ -371,7 +400,9 @@ def build_ssh_tunnel_command(
     ssh_cfg = config.get("ssh_config")
     if ssh_cfg:
         cmd.extend(["-F", os.path.expanduser(ssh_cfg)])
-    elif DEFAULT_SSH_CONFIG_PATH != os.path.expanduser("~/.ssh/config") and os.path.isfile(DEFAULT_SSH_CONFIG_PATH):
+    elif DEFAULT_SSH_CONFIG_PATH != os.path.expanduser(
+        "~/.ssh/config"
+    ) and os.path.isfile(DEFAULT_SSH_CONFIG_PATH):
         cmd.extend(["-F", DEFAULT_SSH_CONFIG_PATH])
 
     if config.get("remote_port") is not None:
@@ -399,13 +430,17 @@ def build_ssh_tunnel_command(
     return cmd
 
 
-def classify_ssh_failure(stderr_lines, *, stderr_password_detected: bool = False, resolved_ssh=None):
+def classify_ssh_failure(
+    stderr_lines, *, stderr_password_detected: bool = False, resolved_ssh=None
+):
     """Map SSH stderr output into (status_label, user_error_msg, optional_hint)."""
     stderr_content = "\n".join(stderr_lines).lower()
 
-    if "bad configuration option" in stderr_content or (
-        "terminating," in stderr_content and "bad configuration" in stderr_content
-    ) or "bad owner or permissions on" in stderr_content:
+    if (
+        "bad configuration option" in stderr_content
+        or ("terminating," in stderr_content and "bad configuration" in stderr_content)
+        or "bad owner or permissions on" in stderr_content
+    ):
         return (
             "SSH Config Error",
             "Invalid ~/.ssh/config syntax or file permissions",
@@ -421,7 +456,10 @@ def classify_ssh_failure(stderr_lines, *, stderr_password_detected: bool = False
             None,
         )
 
-    has_proxy = bool(resolved_ssh and (resolved_ssh.get("proxy_command") or resolved_ssh.get("proxy_jump")))
+    has_proxy = bool(
+        resolved_ssh
+        and (resolved_ssh.get("proxy_command") or resolved_ssh.get("proxy_jump"))
+    )
     if (
         "proxycommand" in stderr_content
         or "exec:" in stderr_content
@@ -523,7 +561,9 @@ sys.stdout.flush()
         f.write(py_body)
     os.chmod(py_path, stat.S_IRUSR | stat.S_IWUSR)
 
-    sh_body = f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(py_path)} \"$@\"\n"
+    sh_body = (
+        f'#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(py_path)} "$@"\n'
+    )
     with open(sh_path, "w") as f:
         f.write(sh_body)
     os.chmod(sh_path, stat.S_IRWXU)
@@ -561,7 +601,9 @@ def load_json_with_comments(filepath):
     except json.JSONDecodeError as e:
         # Provide exact context for the syntax failure
         lines = clean_content.splitlines()
-        error_line = lines[e.lineno - 1].strip() if e.lineno <= len(lines) else "Unknown"
+        error_line = (
+            lines[e.lineno - 1].strip() if e.lineno <= len(lines) else "Unknown"
+        )
         raise ConfigValidationError(
             f"Invalid JSON syntax\n"
             f"  Reason: {e.msg}\n"
@@ -574,20 +616,32 @@ def load_json_with_comments(filepath):
 def validate_config(data, logger_cb=print):
     """Validates the structure of the config dictionary and logs parsed parameters."""
     if not isinstance(data, dict):
-        raise ConfigValidationError("The root of the configuration file must be a JSON object (dictionary).")
+        raise ConfigValidationError(
+            "The root of the configuration file must be a JSON object (dictionary)."
+        )
 
     has_remote_host = "remote_host" in data and data["remote_host"] is not None
     has_ssh_host = "ssh_host" in data and data["ssh_host"] is not None
     if not has_remote_host and not has_ssh_host:
-        raise ConfigValidationError("Missing required root-level key: 'remote_host' (or 'ssh_host' for ~/.ssh/config alias).")
+        raise ConfigValidationError(
+            "Missing required root-level key: 'remote_host' (or 'ssh_host' for ~/.ssh/config alias)."
+        )
 
     if has_remote_host:
         if not isinstance(data["remote_host"], str) or not data["remote_host"].strip():
-            raise ConfigValidationError("The 'remote_host' setting must be a non-empty string.")
+            raise ConfigValidationError(
+                "The 'remote_host' setting must be a non-empty string."
+            )
     if has_ssh_host:
         if not isinstance(data["ssh_host"], str) or not data["ssh_host"].strip():
-            raise ConfigValidationError("The 'ssh_host' setting must be a non-empty string.")
-    if has_remote_host and has_ssh_host and data["remote_host"].strip() != data["ssh_host"].strip():
+            raise ConfigValidationError(
+                "The 'ssh_host' setting must be a non-empty string."
+            )
+    if (
+        has_remote_host
+        and has_ssh_host
+        and data["remote_host"].strip() != data["ssh_host"].strip()
+    ):
         raise ConfigValidationError(
             "Conflicting host settings: specify either 'remote_host' or 'ssh_host', not both with different values."
         )
@@ -597,15 +651,21 @@ def validate_config(data, logger_cb=print):
 
     if "ssh_config" in data and data["ssh_config"] is not None:
         if not isinstance(data["ssh_config"], str) or not data["ssh_config"].strip():
-            raise ConfigValidationError("The 'ssh_config' setting must be a non-empty file path string.")
+            raise ConfigValidationError(
+                "The 'ssh_config' setting must be a non-empty file path string."
+            )
         expanded_ssh_cfg = os.path.expanduser(data["ssh_config"].strip())
         if not os.path.isfile(expanded_ssh_cfg):
-            raise ConfigValidationError(f"Configured 'ssh_config' file not found: '{expanded_ssh_cfg}'")
+            raise ConfigValidationError(
+                f"Configured 'ssh_config' file not found: '{expanded_ssh_cfg}'"
+            )
         logger_cb(f"[Parsed] ssh_config: {expanded_ssh_cfg}")
 
     if "remote_port" in data and data["remote_port"] is not None:
         if not _is_valid_port(data["remote_port"]):
-            raise ConfigValidationError("The 'remote_port' setting must be a valid port integer (1-65535).")
+            raise ConfigValidationError(
+                "The 'remote_port' setting must be a valid port integer (1-65535)."
+            )
         logger_cb(f"[Parsed] remote_port: {data['remote_port']} (explicit override)")
     else:
         logger_cb("[Parsed] remote_port: (inherit from ~/.ssh/config or default 22)")
@@ -616,9 +676,13 @@ def validate_config(data, logger_cb=print):
                 f"The 'remote_user' setting must be of type str. Found: {type(data['remote_user']).__name__}"
             )
         if data["remote_user"].strip():
-            logger_cb(f"[Parsed] remote_user: {data['remote_user']} (explicit override)")
+            logger_cb(
+                f"[Parsed] remote_user: {data['remote_user']} (explicit override)"
+            )
         else:
-            logger_cb("[Parsed] remote_user: (inherit from ~/.ssh/config or current user)")
+            logger_cb(
+                "[Parsed] remote_user: (inherit from ~/.ssh/config or current user)"
+            )
     else:
         logger_cb("[Parsed] remote_user: (inherit from ~/.ssh/config or current user)")
 
@@ -629,46 +693,68 @@ def validate_config(data, logger_cb=print):
             f"The 'services' setting must be of type dict. Found: {type(data['services']).__name__}"
         )
 
-    logger_cb(f"[Parsed] Found {len(data['services'])} service(s) to map in 'services' block.")
+    logger_cb(
+        f"[Parsed] Found {len(data['services'])} service(s) to map in 'services' block."
+    )
 
     for srv_name, srv_conf in data["services"].items():
         if not isinstance(srv_conf, dict):
-            raise ConfigValidationError(f"Service definition for '{srv_name}' must be an object (dictionary).")
-        
+            raise ConfigValidationError(
+                f"Service definition for '{srv_name}' must be an object (dictionary)."
+            )
+
         logger_cb(f"  ↳ Validating service definition: '{srv_name}'")
 
         srv_type = srv_conf.get("type", "local")
         if srv_type not in ["local", "remote"]:
-            raise ConfigValidationError(f"Service '{srv_name}': 'type' must be 'local' or 'remote'. Got '{srv_type}'.")
+            raise ConfigValidationError(
+                f"Service '{srv_name}': 'type' must be 'local' or 'remote'. Got '{srv_type}'."
+            )
         logger_cb(f"      [Parsed] type: {srv_type}")
 
         if "service_port" not in srv_conf:
-            raise ConfigValidationError(f"Service '{srv_name}': Missing required key 'service_port'.")
+            raise ConfigValidationError(
+                f"Service '{srv_name}': Missing required key 'service_port'."
+            )
         if not _is_valid_port(srv_conf["service_port"]):
-            raise ConfigValidationError(f"Service '{srv_name}': 'service_port' must be a valid port integer (1-65535).")
+            raise ConfigValidationError(
+                f"Service '{srv_name}': 'service_port' must be a valid port integer (1-65535)."
+            )
         logger_cb(f"      [Parsed] service_port: {srv_conf['service_port']}")
 
         if srv_type == "local":
             if "local_port" not in srv_conf:
-                raise ConfigValidationError(f"Service '{srv_name}': Missing 'local_port' (required for 'local' type services).")
+                raise ConfigValidationError(
+                    f"Service '{srv_name}': Missing 'local_port' (required for 'local' type services)."
+                )
             if not _is_valid_port(srv_conf["local_port"]):
-                raise ConfigValidationError(f"Service '{srv_name}': 'local_port' must be a valid port integer (1-65535).")
+                raise ConfigValidationError(
+                    f"Service '{srv_name}': 'local_port' must be a valid port integer (1-65535)."
+                )
             logger_cb(f"      [Parsed] local_port: {srv_conf['local_port']}")
         else:
             if "remote_port" not in srv_conf:
-                raise ConfigValidationError(f"Service '{srv_name}': Missing 'remote_port' (required for 'remote' type services).")
+                raise ConfigValidationError(
+                    f"Service '{srv_name}': Missing 'remote_port' (required for 'remote' type services)."
+                )
             if not _is_valid_port(srv_conf["remote_port"]):
-                raise ConfigValidationError(f"Service '{srv_name}': 'remote_port' must be a valid port integer (1-65535).")
+                raise ConfigValidationError(
+                    f"Service '{srv_name}': 'remote_port' must be a valid port integer (1-65535)."
+                )
             logger_cb(f"      [Parsed] remote_port: {srv_conf['remote_port']}")
 
         service_host = srv_conf.get("service_host", "127.0.0.1")
         if not isinstance(service_host, str):
-            raise ConfigValidationError(f"Service '{srv_name}': 'service_host' must be a string.")
+            raise ConfigValidationError(
+                f"Service '{srv_name}': 'service_host' must be a string."
+            )
         logger_cb(f"      [Parsed] service_host: {service_host}")
 
         bind_address = srv_conf.get("bind_address", "127.0.0.1")
         if not isinstance(bind_address, str):
-            raise ConfigValidationError(f"Service '{srv_name}': 'bind_address' must be a string.")
+            raise ConfigValidationError(
+                f"Service '{srv_name}': 'bind_address' must be a string."
+            )
         logger_cb(f"      [Parsed] bind_address: {bind_address}")
 
     logger_cb("Configuration validation complete. No errors found.")
@@ -813,11 +899,15 @@ def check_config_on_startup():
             try:
                 config_data = load_json_with_comments(CONFIG_PATH)
                 validate_config(config_data, logger_cb=lambda m: print(f"    {m}"))
-                print("\n\033[1;32m[✓] Configuration parsed and validated successfully!\033[0m")
+                print(
+                    "\n\033[1;32m[✓] Configuration parsed and validated successfully!\033[0m"
+                )
                 time.sleep(1.0)
                 break
             except ConfigValidationError as e:
-                print(f"\n\033[1;31m[!] Configuration Parsing/Validation Error:\033[0m\n{e}")
+                print(
+                    f"\n\033[1;31m[!] Configuration Parsing/Validation Error:\033[0m\n{e}"
+                )
                 ans = (
                     input(
                         "\nWould you like to reopen the editor to fix the error? [Y/n]: "
@@ -828,7 +918,9 @@ def check_config_on_startup():
                 if ans == "n":
                     break
             except Exception as e:
-                print(f"\n\033[1;31m[!] Unexpected Error parsing configuration file:\033[0m\n{e}")
+                print(
+                    f"\n\033[1;31m[!] Unexpected Error parsing configuration file:\033[0m\n{e}"
+                )
                 ans = (
                     input(
                         "\nWould you like to reopen the editor to fix the error? [Y/n]: "
@@ -1094,7 +1186,9 @@ class SshHostModal(ModalScreen[str]):
 class SshPasswordPrompt(ModalScreen[str]):
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, prompt_text: str = "Enter SSH password or passphrase to proceed"):
+    def __init__(
+        self, prompt_text: str = "Enter SSH password or passphrase to proceed"
+    ):
         super().__init__()
         self.prompt_text = prompt_text
 
@@ -1104,7 +1198,11 @@ class SshPasswordPrompt(ModalScreen[str]):
                 f"[bold cyan]SSH Authentication Required[/bold cyan]\n[dim]{escape(self.prompt_text)}[/dim]",
                 id="dialog_title",
             ),
-            Input(placeholder="Enter password / passphrase", password=True, id="password_input"),
+            Input(
+                placeholder="Enter password / passphrase",
+                password=True,
+                id="password_input",
+            ),
             Container(
                 Button("Submit", variant="primary", id="submit_btn"),
                 Button("Cancel", id="cancel_btn"),
@@ -1241,12 +1339,12 @@ class TunnelApp(App):
         user = self.config.get("remote_user") or None
         port = self.config.get("remote_port")
         ssh_cfg = self.config.get("ssh_config")
-        info = resolve_ssh_target(
-            target, user=user, port=port, ssh_config_path=ssh_cfg
-        )
+        info = resolve_ssh_target(target, user=user, port=port, ssh_config_path=ssh_cfg)
         self.resolved_ssh = info
         if info.get("error"):
-            self.log_msg(f"[bold red]SSH Config Resolution Error:[/bold red] {info['error']}")
+            self.log_msg(
+                f"[bold red]SSH Config Resolution Error:[/bold red] {info['error']}"
+            )
         elif info.get("matched_ssh_config"):
             self.log_msg(
                 f"[cyan]Resolved SSH Host '{target}' via {info['ssh_config_path']}:[/cyan] "
@@ -1254,28 +1352,46 @@ class TunnelApp(App):
             )
             if info.get("explicit_user") or info.get("explicit_port"):
                 base_info = resolve_ssh_target(target, ssh_config_path=ssh_cfg)
-                if info.get("explicit_user") and base_info.get("user") and base_info["user"] != info["user"]:
+                if (
+                    info.get("explicit_user")
+                    and base_info.get("user")
+                    and base_info["user"] != info["user"]
+                ):
                     self.log_msg(
                         f"[dim]Note: config.json 'remote_user' ('{info['user']}') overrides ~/.ssh/config User ('{base_info['user']}').[/dim]"
                     )
-                if info.get("explicit_port") and base_info.get("port") and base_info["port"] != info["port"]:
+                if (
+                    info.get("explicit_port")
+                    and base_info.get("port")
+                    and base_info["port"] != info["port"]
+                ):
                     self.log_msg(
                         f"[dim]Note: config.json 'remote_port' ({info['port']}) overrides ~/.ssh/config Port ({base_info['port']}).[/dim]"
                     )
 
     def load_config(self):
-        self.log_msg(f"[bold cyan]Trying to read config file '{CONFIG_PATH}'...[/bold cyan]")
+        self.log_msg(
+            f"[bold cyan]Trying to read config file '{CONFIG_PATH}'...[/bold cyan]"
+        )
 
         try:
             config_data = load_json_with_comments(CONFIG_PATH)
-            self.log_msg("[bold cyan]Loading and validating configuration data...[/bold cyan]")
-            validate_config(config_data, logger_cb=lambda m: self.log_msg(f"[dim]{m}[/dim]"))
+            self.log_msg(
+                "[bold cyan]Loading and validating configuration data...[/bold cyan]"
+            )
+            validate_config(
+                config_data, logger_cb=lambda m: self.log_msg(f"[dim]{m}[/dim]")
+            )
             return config_data
         except ConfigValidationError as e:
-            self.log_msg(f"\n[bold red]Configuration Validation Error:[/bold red]\n[red]{e}[/red]\n")
+            self.log_msg(
+                f"\n[bold red]Configuration Validation Error:[/bold red]\n[red]{e}[/red]\n"
+            )
             return None
         except Exception as e:
-            self.log_msg(f"\n[bold red]Unexpected Error parsing config:[/bold red]\n[red]{e}[/red]\n")
+            self.log_msg(
+                f"\n[bold red]Unexpected Error parsing config:[/bold red]\n[red]{e}[/red]\n"
+            )
             return None
 
     def compose(self) -> ComposeResult:
@@ -1437,7 +1553,9 @@ class TunnelApp(App):
                         if bind_ip == "0.0.0.0"
                         else f"[bold green]{bind_ip}[/]"
                     )
-                    target_compact = self._compact_target_label(service_host, service_port)
+                    target_compact = self._compact_target_label(
+                        service_host, service_port
+                    )
                     if srv_type == "remote":
                         map_str = f"[bold cyan][R][/] {compact_bind}:{listen_port} [yellow]↢[/] {target_compact}"
                     else:
@@ -1612,7 +1730,9 @@ class TunnelApp(App):
             new_statuses = {}
             for srv, srv_conf in self.config.get("services", {}).items():
                 new_file_bind = srv_conf.get("bind_address", "127.0.0.1")
-                old_file_bind = old_services.get(srv, {}).get("bind_address", "127.0.0.1")
+                old_file_bind = old_services.get(srv, {}).get(
+                    "bind_address", "127.0.0.1"
+                )
                 if srv in self.service_bindings and new_file_bind == old_file_bind:
                     new_bindings[srv] = self.service_bindings[srv]
                 else:
@@ -1642,7 +1762,9 @@ class TunnelApp(App):
         ssh_cfg = self.config.get("ssh_config") if self.config else None
         hosts = list_ssh_config_hosts(ssh_cfg)
         current = get_ssh_target(self.config) if self.config else ""
-        selected = await self.push_screen_wait(SshHostModal(hosts, current_host=current))
+        selected = await self.push_screen_wait(
+            SshHostModal(hosts, current_host=current)
+        )
         if selected:
             if not self.config:
                 self.log_msg("[red]Cannot switch host: No valid config loaded.[/red]")
@@ -1762,15 +1884,21 @@ class TunnelApp(App):
             )
             host_label = f"{eff_user}@{target}" if eff_user else target
             if res.get("matched_ssh_config"):
-                remote_host = f"[bold cyan]{escape(host_label)}[/] [dim green](ssh_config)[/]"
+                remote_host = (
+                    f"[bold cyan]{escape(host_label)}[/] [dim green](ssh_config)[/]"
+                )
             else:
                 remote_host = f"[bold cyan]{escape(host_label)}[/]"
             remote_port = f"[bold cyan]{eff_port}[/]"
             eff_hostname = res.get("hostname", target)
             if eff_hostname and eff_hostname != target:
-                extra_route_rows.append(("Resolved Host:", f"[cyan]{escape(eff_hostname)}[/]"))
+                extra_route_rows.append(
+                    ("Resolved Host:", f"[cyan]{escape(eff_hostname)}[/]")
+                )
             if res.get("proxy_command") or res.get("proxy_jump"):
-                extra_route_rows.append(("SSH Route:", f"[cyan]{escape(res.get('route_summary', ''))}[/]"))
+                extra_route_rows.append(
+                    ("SSH Route:", f"[cyan]{escape(res.get('route_summary', ''))}[/]")
+                )
 
         table.add_row("Remote Host:", remote_host, "SSH Port:", remote_port)
         for idx in range(0, len(extra_route_rows), 2):
@@ -1866,7 +1994,10 @@ class TunnelApp(App):
                 if not raw:
                     return
                 req = json.loads(raw.decode("utf-8"))
-                if not secrets.compare_digest(req.get("token", ""), token) or not self.running:
+                if (
+                    not secrets.compare_digest(req.get("token", ""), token)
+                    or not self.running
+                ):
                     writer.write(b'{"cancel": true}\n')
                     await writer.drain()
                     return
@@ -1880,7 +2011,9 @@ class TunnelApp(App):
 
                     self._auth_prompt_active = True
                     self.stats.status = "Password Required"
-                    self.log_msg(f"[bold yellow]SSH is asking for a password:[/bold yellow] {prompt_text}")
+                    self.log_msg(
+                        f"[bold yellow]SSH is asking for a password:[/bold yellow] {prompt_text}"
+                    )
                     modal = SshPasswordPrompt(prompt_text=prompt_text)
                     self._active_password_modal = modal
                     try:
@@ -1900,7 +2033,9 @@ class TunnelApp(App):
                             except Exception:
                                 pass
                     else:
-                        payload = (json.dumps({"password": password}) + "\n").encode("utf-8")
+                        payload = (json.dumps({"password": password}) + "\n").encode(
+                            "utf-8"
+                        )
                         writer.write(payload)
                         await writer.drain()
             except Exception:
@@ -1916,14 +2051,18 @@ class TunnelApp(App):
                 except Exception:
                     pass
 
-        self._askpass_server = await asyncio.start_unix_server(handle_client, path=sock_path)
+        self._askpass_server = await asyncio.start_unix_server(
+            handle_client, path=sock_path
+        )
         os.chmod(sock_path, stat.S_IRUSR | stat.S_IWUSR)
         return script_path
 
     @work(exclusive=True)
     async def run_ssh_loop(self):
         if not self.config:
-            self.log_msg("[red]Error: System looping stalled without a valid config.[/red]")
+            self.log_msg(
+                "[red]Error: System looping stalled without a valid config.[/red]"
+            )
             return
 
         self.log_msg(
@@ -1934,7 +2073,9 @@ class TunnelApp(App):
         try:
             askpass_script = await self._start_askpass_server()
         except Exception as e:
-            self.log_msg(f"[yellow]Askpass helper unavailable ({e}); continuing without interactive auth modal.[/yellow]")
+            self.log_msg(
+                f"[yellow]Askpass helper unavailable ({e}); continuing without interactive auth modal.[/yellow]"
+            )
 
         try:
             while self.running:
@@ -1961,7 +2102,11 @@ class TunnelApp(App):
                 if self.resolved_ssh and self.resolved_ssh.get("proxy_command"):
                     try:
                         proxy_parts = shlex.split(self.resolved_ssh["proxy_command"])
-                        if proxy_parts and not shutil.which(proxy_parts[0]) and not os.path.exists(proxy_parts[0]):
+                        if (
+                            proxy_parts
+                            and not shutil.which(proxy_parts[0])
+                            and not os.path.exists(proxy_parts[0])
+                        ):
                             self.log_msg(
                                 f"[bold yellow]Warning: ProxyCommand binary '{proxy_parts[0]}' not found on PATH.[/bold yellow]"
                             )
@@ -2006,9 +2151,15 @@ class TunnelApp(App):
                             elif is_ssh_password_prompt(line_str):
                                 stderr_password_detected = True
                                 self.stats.status = "Password Required"
-                                self.log_msg("[bold yellow]SSH is asking for a password.[/bold yellow]")
-                                self.log_msg("[yellow]This may be because no SSH keys are loaded in ssh-agent.[/yellow]")
-                                self.log_msg("[yellow]Please check your SSH agent and keys, or try connecting manually.[/yellow]")
+                                self.log_msg(
+                                    "[bold yellow]SSH is asking for a password.[/bold yellow]"
+                                )
+                                self.log_msg(
+                                    "[yellow]This may be because no SSH keys are loaded in ssh-agent.[/yellow]"
+                                )
+                                self.log_msg(
+                                    "[yellow]Please check your SSH agent and keys, or try connecting manually.[/yellow]"
+                                )
                         color = "red" if is_stderr else "dim white"
                         self.log_msg(f"[{color}][SSH] {line_str}[/{color}]")
 
@@ -2044,13 +2195,18 @@ class TunnelApp(App):
                                 is_stderr
                                 and partial
                                 and partial != last_partial_logged
-                                and (is_ssh_password_prompt(partial) or is_proxy_auth_prompt(partial))
+                                and (
+                                    is_ssh_password_prompt(partial)
+                                    or is_proxy_auth_prompt(partial)
+                                )
                             ):
                                 handle_stream_line(partial, is_stderr=True)
                                 last_partial_logged = partial
 
                     stream_tasks = [
-                        asyncio.create_task(read_stream(self.ssh_process.stdout, False)),
+                        asyncio.create_task(
+                            read_stream(self.ssh_process.stdout, False)
+                        ),
                         asyncio.create_task(read_stream(self.ssh_process.stderr, True)),
                     ]
 
@@ -2069,7 +2225,9 @@ class TunnelApp(App):
                             if stable_elapsed >= STABILITY_WAIT_SEC:
                                 break
                         try:
-                            await asyncio.wait_for(self.ssh_process.wait(), timeout=0.05)
+                            await asyncio.wait_for(
+                                self.ssh_process.wait(), timeout=0.05
+                            )
                             exited_early = True
                             break
                         except asyncio.TimeoutError:
@@ -2081,14 +2239,18 @@ class TunnelApp(App):
                         if not self.intentional_restart and not self._auth_cancelled:
                             try:
                                 await asyncio.wait_for(
-                                    asyncio.gather(*stream_tasks, return_exceptions=True),
+                                    asyncio.gather(
+                                        *stream_tasks, return_exceptions=True
+                                    ),
                                     timeout=0.2,
                                 )
                             except asyncio.TimeoutError:
                                 pass
 
                         if self.intentional_restart:
-                            self.log_msg("[dim]Process terminated for reconfiguration.[/dim]")
+                            self.log_msg(
+                                "[dim]Process terminated for reconfiguration.[/dim]"
+                            )
                             self.stats.record_disconnect()
                             continue
 
@@ -2264,7 +2426,9 @@ class TunnelApp(App):
                 )
 
                 try:
-                    self.sleep_task = asyncio.create_task(asyncio.sleep(RECONNECT_DELAY_SEC))
+                    self.sleep_task = asyncio.create_task(
+                        asyncio.sleep(RECONNECT_DELAY_SEC)
+                    )
                     await self.sleep_task
                 except asyncio.CancelledError:
                     pass
